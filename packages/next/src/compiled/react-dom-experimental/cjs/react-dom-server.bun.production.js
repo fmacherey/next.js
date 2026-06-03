@@ -131,6 +131,7 @@ var unitlessNumbers = new Set(
     ["markerEnd", "marker-end"],
     ["markerMid", "marker-mid"],
     ["markerStart", "marker-start"],
+    ["maskType", "mask-type"],
     ["overlinePosition", "overline-position"],
     ["overlineThickness", "overline-thickness"],
     ["paintOrder", "paint-order"],
@@ -870,6 +871,7 @@ function pushAttribute(target, name, value) {
     case "async":
     case "autoPlay":
     case "controls":
+    case "credentialless":
     case "default":
     case "defer":
     case "disabled":
@@ -3144,8 +3146,10 @@ function hoistHoistables(parentState, childState) {
   childState.stylesheets.forEach(hoistStylesheetDependency, parentState);
   childState.suspenseyImages && (parentState.suspenseyImages = !0);
 }
-function hasSuspenseyContent(hoistableState) {
-  return 0 < hoistableState.stylesheets.size || hoistableState.suspenseyImages;
+function hasSuspenseyContent(hoistableState, flushingInShell) {
+  return flushingInShell
+    ? hoistableState.suspenseyImages
+    : 0 < hoistableState.stylesheets.size || hoistableState.suspenseyImages;
 }
 var bind = Function.prototype.bind,
   REACT_CLIENT_REFERENCE = Symbol.for("react.client.reference");
@@ -3337,7 +3341,12 @@ function trackUsedThenable(thenableState, thenable, index) {
     case "fulfilled":
       return thenable.value;
     case "rejected":
-      throw thenable.reason;
+      thenableState = thenable.reason;
+      if (void 0 === thenableState && !("reason" in thenable))
+        throw Error(
+          "A rejected Promise was passed to React without a `reason` property. React threw a generic error from where the Promise was used to assist in identifying the problematic Promise. Make sure that instrumented Promises correctly set the `reason` property when setting `status` to `'rejected'`."
+        );
+      throw thenableState;
     default:
       "string" === typeof thenable.status
         ? thenable.then(noop, noop)
@@ -3755,7 +3764,26 @@ function describeNativeComponentFrame(fn, construct) {
               } catch (x$24) {
                 control = x$24;
               }
-              fn.call(Fake.prototype);
+              Fake = !1;
+              try {
+                var prevProps = Object.getOwnPropertyDescriptor(
+                  fn.prototype,
+                  "props"
+                );
+                Object.defineProperty(fn.prototype, "props", {
+                  configurable: !0,
+                  set: function () {
+                    throw Error();
+                  }
+                });
+                Fake = !0;
+                new fn();
+              } finally {
+                Fake &&
+                  (void 0 !== prevProps
+                    ? Object.defineProperty(fn.prototype, "props", prevProps)
+                    : delete fn.prototype.props);
+              }
             }
           } else {
             try {
@@ -3942,7 +3970,7 @@ function getViewTransitionClassName(defaultClass, eventClass) {
 function isEligibleForOutlining(request, boundary) {
   return (
     (500 < boundary.byteSize ||
-      hasSuspenseyContent(boundary.contentState) ||
+      hasSuspenseyContent(boundary.contentState, !1) ||
       boundary.defer) &&
     null === boundary.preamble
   );
@@ -6361,11 +6389,13 @@ function finishedTask(request, boundary, row, segment) {
           null !== row &&
             hoistHoistables(row.hoistables, boundary.contentState),
           isEligibleForOutlining(request, boundary) ||
-            (boundary.fallbackAbortableTasks.forEach(abortTaskSoft, request),
+            (request.allPendingTasks++,
+            boundary.fallbackAbortableTasks.forEach(abortTaskSoft, request),
             boundary.fallbackAbortableTasks.clear(),
             null !== row &&
               0 === --row.pendingTasks &&
-              finishSuspenseListRow(request, row)),
+              finishSuspenseListRow(request, row),
+            request.allPendingTasks--),
           0 === request.pendingRootTasks &&
             null === request.trackedPostpones &&
             null !== boundary.preamble &&
@@ -6392,8 +6422,10 @@ function finishedTask(request, boundary, row, segment) {
                 finishedTask(request, postponedBoundary, null, null);
               }
           }
+          request.allPendingTasks++;
           0 === --boundary.pendingTasks &&
             finishSuspenseListRow(request, boundary);
+          request.allPendingTasks--;
         }
       }
     else
@@ -6582,8 +6614,10 @@ function performWork(request$jscomp$1) {
                 untrackBoundary(request, boundary$jscomp$0);
                 var boundaryRow = boundary$jscomp$0.row;
                 null !== boundaryRow &&
+                  (request.allPendingTasks++,
                   0 === --boundaryRow.pendingTasks &&
-                  finishSuspenseListRow(request, boundaryRow);
+                    finishSuspenseListRow(request, boundaryRow),
+                  request.allPendingTasks--);
                 boundary$jscomp$0.parentFlushed &&
                   request.clientRenderedBoundaries.push(boundary$jscomp$0);
                 0 === request.pendingRootTasks &&
@@ -6766,7 +6800,7 @@ function flushSegment(request, destination, segment, hoistableState) {
     !flushingPartialBoundaries &&
     isEligibleForOutlining(request, boundary) &&
     (flushedByteSize + boundary.byteSize > request.progressiveChunkSize ||
-      hasSuspenseyContent(boundary.contentState) ||
+      hasSuspenseyContent(boundary.contentState, flushingShell) ||
       boundary.defer)
   )
     (boundary.rootSegmentID = request.nextSegmentId++),
@@ -6949,7 +6983,8 @@ function flushPartiallyCompletedSegment(
     : !!destination.write('"></template>');
   return destination;
 }
-var flushingPartialBoundaries = !1;
+var flushingPartialBoundaries = !1,
+  flushingShell = !1;
 function flushCompletedQueues(request, destination) {
   try {
     if (!(0 < request.pendingRootTasks)) {
@@ -7058,7 +7093,9 @@ function flushCompletedQueues(request, destination) {
             completedPreambleSegments++
           )
             writeChunk(destination, bodyChunks[completedPreambleSegments]);
+        flushingShell = !0;
         flushSegment(request, destination, completedRootSegment, null);
+        flushingShell = !1;
         request.completedRootSegment = null;
         var resumableState$jscomp$0 = request.resumableState,
           renderState$jscomp$0 = request.renderState;
@@ -7383,11 +7420,11 @@ function getPostponedState(request) {
 }
 function ensureCorrectIsomorphicReactVersion() {
   var isomorphicReactPackageVersion = React.version;
-  if ("19.3.0-experimental-65eec428-20251218" !== isomorphicReactPackageVersion)
+  if ("19.3.0-experimental-f0dfee38-20260529" !== isomorphicReactPackageVersion)
     throw Error(
       'Incompatible React versions: The "react" and "react-dom" packages must have the exact same version. Instead got:\n  - react:      ' +
         (isomorphicReactPackageVersion +
-          "\n  - react-dom:  19.3.0-experimental-65eec428-20251218\nLearn more: https://react.dev/warnings/version-mismatch")
+          "\n  - react-dom:  19.3.0-experimental-f0dfee38-20260529\nLearn more: https://react.dev/warnings/version-mismatch")
     );
 }
 ensureCorrectIsomorphicReactVersion();
@@ -7932,4 +7969,4 @@ exports.resumeToPipeableStream = function (children, postponedState, options) {
     }
   };
 };
-exports.version = "19.3.0-experimental-65eec428-20251218";
+exports.version = "19.3.0-experimental-f0dfee38-20260529";

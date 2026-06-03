@@ -30,6 +30,7 @@ use turbopack_core::{
 use crate::{
     references::util::{
         request_to_string, throw_module_not_found_error_expr, throw_module_not_found_expr,
+        throw_module_not_found_expr_async,
     },
     runtime_functions::{
         TURBOPACK_ASYNC_LOADER, TURBOPACK_EXTERNAL_IMPORT, TURBOPACK_EXTERNAL_REQUIRE,
@@ -84,7 +85,7 @@ pub(crate) enum PatternMapping {
     /// ```js
     /// require(`./images/${name}.png`)
     /// ```
-    Map(#[bincode(with = "turbo_bincode::indexmap")] FxIndexMap<String, SinglePatternMapping>),
+    Map(#[bincode(with = "turbo_bincode::indexmap")] FxIndexMap<RcStr, SinglePatternMapping>),
 }
 
 #[derive(
@@ -100,7 +101,7 @@ impl SinglePatternMapping {
         match self {
             Self::Invalid => {
                 quote!(
-                    "(() => { throw new Error('could not resolve \"' + $arg + '\" into a module'); })()" as Expr,
+                    "(() => {throw new Error('could not resolve \"' + $arg + '\" into a module');})()" as Expr,
                     arg: Expr = key_expr.into_owned()
                 )
             }
@@ -139,7 +140,7 @@ impl SinglePatternMapping {
         match self {
             Self::Invalid => {
                 let error = quote_expr!(
-                    "() => { throw new Error('could not resolve \"' + $arg + '\" into a module'); }",
+                    "() => {throw new Error('could not resolve \"' + $arg + '\" into a module');}",
                     arg: Expr = key_expr.into_owned()
                 );
                 Expr::Call(CallExpr {
@@ -152,7 +153,7 @@ impl SinglePatternMapping {
                     ..Default::default()
                 })
             }
-            Self::Unresolvable(_) => self.create_id(key_expr),
+            Self::Unresolvable(request) => throw_module_not_found_expr_async(request),
             Self::External(_, ExternalType::EcmaScriptModule) => {
                 if import_externals {
                     Expr::Call(CallExpr {
@@ -230,25 +231,19 @@ enum ImportMode {
 }
 
 fn create_context_map(
-    map: &FxIndexMap<String, SinglePatternMapping>,
+    map: &FxIndexMap<RcStr, SinglePatternMapping>,
     key_expr: &Expr,
     import_mode: ImportMode,
 ) -> Expr {
     let props = map
         .iter()
-        .map(|(k, v)| {
-            PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
-                key: PropName::Str(k.as_str().into()),
+        .map(|(k, v)| {PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {key: PropName::Str(k.as_str().into()),
                 value: quote_expr!(
-                        "{ id: () => $id, module: () => $module }",
+                        "{id: () => $id, module: () => $module}",
                         id: Expr = v.create_id(Cow::Borrowed(key_expr)),
-                        module: Expr = match import_mode {
-                            ImportMode::Require => v.create_require(Cow::Borrowed(key_expr)),
-                            ImportMode::Import { import_externals } => v.create_import(Cow::Borrowed(key_expr), import_externals),
-                        },
-                    ),
-            })))
-        })
+                        module: Expr = match import_mode {ImportMode::Require => v.create_require(Cow::Borrowed(key_expr)),
+                            ImportMode::Import {import_externals} => v.create_import(Cow::Borrowed(key_expr), import_externals),},
+                    ),})))})
         .collect();
 
     Expr::Object(ObjectLit {
@@ -309,6 +304,7 @@ async fn to_single_pattern_mapping(
     origin: Vc<Box<dyn ResolveOrigin>>,
     chunking_context: Vc<Box<dyn ChunkingContext>>,
     resolve_item: &ModuleResolveResultItem,
+    primary: &[(turbopack_core::resolve::RequestKey, ModuleResolveResultItem)],
     resolve_type: ResolveType,
 ) -> Result<SinglePatternMapping> {
     let module = match resolve_item {
@@ -323,12 +319,27 @@ async fn to_single_pattern_mapping(
                 "unknown module type".to_string(),
             ));
         }
-        ModuleResolveResultItem::Error(str) => {
-            return Ok(SinglePatternMapping::Unresolvable(str.await?.to_string()));
+        ModuleResolveResultItem::Error(issue) => {
+            return Ok(SinglePatternMapping::Unresolvable(
+                issue
+                    .into_trait_ref()
+                    .await?
+                    .title()
+                    .await?
+                    .to_unstyled_string(),
+            ));
         }
-        ModuleResolveResultItem::OutputAsset(_)
-        | ModuleResolveResultItem::Empty
-        | ModuleResolveResultItem::Custom(_) => {
+        ModuleResolveResultItem::Duplicate(first) => {
+            return Box::pin(to_single_pattern_mapping(
+                origin,
+                chunking_context,
+                &primary[*first].1,
+                primary,
+                resolve_type,
+            ))
+            .await;
+        }
+        ModuleResolveResultItem::Empty | ModuleResolveResultItem::Custom(_) => {
             // TODO implement mapping
             CodeGenerationIssue {
                 severity: IssueSeverity::Bug,
@@ -345,6 +356,7 @@ async fn to_single_pattern_mapping(
                 )
                 .resolved_cell(),
                 path: origin.origin_path().owned().await?,
+                source: None,
             }
             .resolved_cell()
             .emit();
@@ -354,12 +366,17 @@ async fn to_single_pattern_mapping(
     if let Some(chunkable) = ResolvedVc::try_downcast::<Box<dyn ChunkableModule>>(module) {
         match resolve_type {
             ResolveType::AsyncChunkLoader => {
-                let loader_id = chunking_context.async_loader_chunk_item_id(*chunkable);
-                return Ok(SinglePatternMapping::ModuleLoader(loader_id.owned().await?));
+                let ident = chunking_context.async_loader_chunk_item_ident(*chunkable);
+                let loader_id = chunking_context
+                    .chunk_item_id_strategy()
+                    .await?
+                    .get_id_from_ident(ident)
+                    .await?;
+                return Ok(SinglePatternMapping::ModuleLoader(loader_id));
             }
             ResolveType::ChunkItem => {
-                let item_id = chunkable.chunk_item_id(chunking_context);
-                return Ok(SinglePatternMapping::Module(item_id.owned().await?));
+                let item_id = chunkable.chunk_item_id(chunking_context).await?;
+                return Ok(SinglePatternMapping::Module(item_id));
             }
         }
     }
@@ -371,6 +388,7 @@ async fn to_single_pattern_mapping(
         ))
         .resolved_cell(),
         path: origin.origin_path().owned().await?,
+        source: None,
     }
     .resolved_cell()
     .emit();
@@ -398,24 +416,37 @@ impl PatternMapping {
             .cell()),
             1 if !request.request_pattern().await?.has_dynamic_parts() => {
                 let resolve_item = &result.primary.first().unwrap().1;
-                let single_pattern_mapping =
-                    to_single_pattern_mapping(origin, chunking_context, resolve_item, resolve_type)
-                        .await?;
+                let single_pattern_mapping = to_single_pattern_mapping(
+                    origin,
+                    chunking_context,
+                    resolve_item,
+                    &result.primary,
+                    resolve_type,
+                )
+                .await?;
                 Ok(PatternMapping::Single(single_pattern_mapping).cell())
             }
             _ => {
+                let primary = &result.primary;
                 let mut set = HashSet::new();
-                let map = result
-                    .primary
+                let items: Vec<(RcStr, &ModuleResolveResultItem)> = primary
                     .iter()
                     .filter_map(|(k, v)| {
                         let request = k.request.as_ref()?;
-                        set.insert(request).then(|| (request.to_string(), v))
+                        set.insert(request).then(|| (request.clone(), v))
                     })
+                    .collect();
+                let map = items
+                    .into_iter()
                     .map(|(k, v)| async move {
-                        let single_pattern_mapping =
-                            to_single_pattern_mapping(origin, chunking_context, v, resolve_type)
-                                .await?;
+                        let single_pattern_mapping = to_single_pattern_mapping(
+                            origin,
+                            chunking_context,
+                            v,
+                            primary,
+                            resolve_type,
+                        )
+                        .await?;
                         Ok((k, single_pattern_mapping))
                     })
                     .try_join()

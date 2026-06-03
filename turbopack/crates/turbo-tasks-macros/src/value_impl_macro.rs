@@ -5,7 +5,7 @@ use syn::{
     Error, Expr, ExprLit, Generics, ImplItem, ImplItemFn, ItemImpl, Lit, LitStr, Meta,
     MetaNameValue, Path, Token, Type,
     parse::{Parse, ParseStream},
-    parse_macro_input, parse_quote,
+    parse_macro_input,
     spanned::Spanned,
 };
 
@@ -14,10 +14,10 @@ use crate::{
         DefinitionContext, FunctionArguments, NativeFn, TurboFn, filter_inline_attributes,
         split_function_attributes,
     },
-    global_name::global_name,
+    global_name::{global_name_for_method, global_name_for_trait_method_impl},
     ident::{
-        get_cast_to_fat_pointer_ident, get_inherent_impl_function_ident, get_path_ident,
-        get_trait_impl_function_ident, get_type_ident,
+        get_inherent_impl_function_ident, get_path_ident, get_trait_impl_function_ident,
+        get_type_ident, get_vtable_register_fn_ident,
     },
     self_filter::is_self_used,
 };
@@ -101,6 +101,8 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
                 }
             };
             let is_self_used = func_args.operation.is_some() || is_self_used(block);
+            let is_root = func_args.root.is_some();
+            let is_session_dependent = func_args.session_dependent.is_some();
 
             let Some(turbo_fn) = TurboFn::new(
                 sig,
@@ -112,18 +114,18 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
                     // An error occurred while parsing the function signature.
                 };
             };
-
             let inline_function_ident = turbo_fn.inline_ident();
             let (inline_signature, inline_block) = turbo_fn.inline_signature_and_block(block);
             let inline_attrs = filter_inline_attributes(attrs.iter().copied());
-            let function_path_string = format!("{ty}::{ident}", ty = ty.to_token_stream());
             let native_fn = NativeFn {
-                function_global_name: global_name(&function_path_string),
-                function_path_string,
-                function_path: parse_quote! { <#ty>::#inline_function_ident },
+                function_global_name: global_name_for_method(ty, ident),
+                function_path_string: format!("{ty}::{ident}", ty = ty.to_token_stream()),
+                function_path: quote! { <#ty>::#inline_function_ident },
                 is_method: turbo_fn.is_method(),
                 is_self_used,
                 filter_trait_call_args: None, // not a trait method
+                is_root,
+                is_session_dependent,
             };
 
             let native_function_ident = get_inherent_impl_function_ident(ty_ident, ident);
@@ -149,14 +151,9 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
                         pub(self) #inline_signature #inline_block
                     }
 
-                    static #native_function_ident:
-                        turbo_tasks::macro_helpers::Lazy<#native_function_ty> =
-                            turbo_tasks::macro_helpers::Lazy::new(|| #native_function_def);
-
-                    // Register the function for deserialization
-                    turbo_tasks::macro_helpers::inventory_submit! {
-                        turbo_tasks::macro_helpers::CollectableFunction(&#native_function_ident)
-                    }
+                    turbo_tasks::macro_helpers::turbo_register!(
+                        #native_function_ident: #native_function_ty = #native_function_def
+                    );
                 })
         }
 
@@ -178,11 +175,9 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
         items: &[ImplItem],
     ) -> TokenStream2 {
         let trait_ident = get_path_ident(trait_path);
+        let vtable_register_ident = get_vtable_register_fn_ident(ty_ident, &trait_ident);
 
         let (impl_generics, _, where_clause) = generics.split_for_impl();
-
-        let cast_to_fat_pointer_ident: Ident =
-            get_cast_to_fat_pointer_ident(&trait_ident, ty_ident);
 
         let mut trait_methods = Vec::new();
         let mut trait_functions = Vec::with_capacity(items.len());
@@ -213,6 +208,8 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
                 };
                 // operations are not currently compatible with methods
                 let is_self_used = func_args.operation.is_some() || is_self_used(block);
+                let is_root = func_args.root.is_some();
+                let is_session_dependent = func_args.session_dependent.is_some();
 
                 let Some(turbo_fn) = TurboFn::new(
                     sig,
@@ -233,23 +230,20 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
                 let (inline_signature, inline_block) = turbo_fn.inline_signature_and_block(block);
                 let inline_attrs = filter_inline_attributes(attrs.iter().copied());
                 let native_fn = NativeFn {
-                    // This global name breaks the pattern.  It isn't clear if it is intentional
-                    function_global_name: global_name(format!(
-                        "{ty}::{trait_path}::{ident}",
-                        ty = ty.to_token_stream(),
-                        trait_path = trait_path.to_token_stream()
-                    )),
+                    function_global_name: global_name_for_trait_method_impl(ty, trait_path, ident),
                     function_path_string: format!(
                         "<{ty} as {trait_path}>::{ident}",
                         ty = ty.to_token_stream(),
                         trait_path = trait_path.to_token_stream()
                     ),
-                    function_path: parse_quote! {
+                    function_path: quote! {
                         <#ty as #inline_extension_trait_ident>::#inline_function_ident
                     },
                     is_method: turbo_fn.is_method(),
                     is_self_used,
                     filter_trait_call_args: turbo_fn.filter_trait_call_args(),
+                    is_root,
+                    is_session_dependent,
                 };
 
                 let native_function_ident =
@@ -282,22 +276,17 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
                         #inline_signature #inline_block
                     }
 
-                    static #native_function_ident:
-                        turbo_tasks::macro_helpers::Lazy<#native_function_ty> =
-                            turbo_tasks::macro_helpers::Lazy::new(|| #native_function_def);
-
-                    // Register the function for deserialization
-                    turbo_tasks::macro_helpers::inventory_submit! {
-                        turbo_tasks::macro_helpers::CollectableFunction(&#native_function_ident)
-                    }
+                    turbo_tasks::macro_helpers::turbo_register!(
+                        #native_function_ident: #native_function_ty = #native_function_def
+                    );
                 });
 
+                let method_name_str = syn::LitStr::new(&ident.to_string(), ident.span());
                 trait_methods.push(quote! {
-                    (stringify!(#ident), &#native_function_ident),
+                    (#method_name_str, &#native_function_ident)
                 });
             }
         }
-        let value_name = global_name(quote! {stringify!(#ty_ident)});
         quote! {
             // Register all the function impls so the ValueType can find them
             // This means objects resolve as
@@ -305,34 +294,52 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {
             // 2 TraitTypes (requires functions)
             // 3 ValueTypes (requires functions and TraitTypeIds)
             // 4.VTableRegistries (requires ValueTypeIds)
-            turbo_tasks::macro_helpers::inventory_submit!{
-                turbo_tasks::macro_helpers::CollectableTraitMethods(
-                    #value_name,
-                    || (<::std::boxed::Box<dyn #trait_path> as turbo_tasks::VcValueTrait>::get_trait_type_id(),
-                        vec![#(#trait_methods)*])
-                )
-            }
+            turbo_tasks::macro_helpers::inventory_submit!{{
+                const LEN: usize = <::std::boxed::Box<dyn #trait_path> as turbo_tasks::macro_helpers::TraitVtablePrototype>::LEN;
+                static METHODS: [&turbo_tasks::macro_helpers::NativeFunction; LEN] = turbo_tasks::macro_helpers::build_trait_vtable::<::std::boxed::Box<dyn #trait_path>, LEN>(&[#(#trait_methods),*]);
 
-            // These can execute later so they can reference trait_types during registration
+                turbo_tasks::macro_helpers::CollectableTraitMethods {
+                    value_type: <#ty as turbo_tasks::macro_helpers::RegistryDef::<turbo_tasks::ValueType>>::DEF,
+                    trait_type: <::std::boxed::Box<dyn #trait_path> as turbo_tasks::macro_helpers::RegistryDef::<turbo_tasks::TraitType>>::DEF,
+                    methods: &METHODS,
+                    finalize_vtable_registry: || {
+                        <::std::boxed::Box<dyn #trait_path> as turbo_tasks::VcValueTrait>::IMPL_VTABLES
+                            .finalize();
+                    },
+                }
+            }}
 
-            turbo_tasks::macro_helpers::inventory_submit!{
-                turbo_tasks::macro_helpers::CollectableTraitCastFunctions(
-                    <::std::boxed::Box<dyn #trait_path> as turbo_tasks::VcValueTrait>::get_trait_type_id,
-                    <#ty as turbo_tasks::VcValueType>::get_value_type_id,
-                    #cast_to_fat_pointer_ident as *const ()
-                )
-            }
+            // Queue this `impl Trait for Concrete` into the trait's `VTableRegistry` at program
+            // load. The ctor runs before `ValueType` ids are assigned, so it just appends to a
+            // `Vec`; the map keyed by `ValueTypeId` is built lazily inside the `VALUES`
+            // `LazyLock` initializer (via `CollectableTraitMethods::finalize_vtable_registry`).
+            // The vtable pointer is materialized at compile time via the null-fat-ptr trick, so
+            // there's no runtime `transmute` or indirect fn call.
 
-            #[allow(non_snake_case)]
-            fn #cast_to_fat_pointer_ident(raw: * const ()) -> *const dyn #trait_path {
-                let typed = raw as *const #ty;
-                typed as *const dyn #trait_path
+            #[cfg(not(rust_analyzer))]
+            turbo_tasks::macro_helpers::ctor::declarative::ctor! {
+                #[ctor(unsafe)]
+                #[allow(non_snake_case)]
+                fn #vtable_register_ident() {
+                    <::std::boxed::Box<dyn #trait_path> as turbo_tasks::VcValueTrait>::IMPL_VTABLES
+                        .register(
+                            <#ty as turbo_tasks::macro_helpers::RegistryDef::<turbo_tasks::ValueType>>::DEF,
+                            {
+                                let p: *const #ty = ::std::ptr::null();
+                                // This attaches a fat pointer to the null pointer.
+                                let fat: *const dyn #trait_path = p;
+                                fat
+                            },
+                        );
+                }
             }
 
             // NOTE(alexkirsz) We can't have a general `turbo_tasks::Upcast<Box<dyn Trait>> for T where T: Trait` because
             // rustc complains: error[E0210]: type parameter `T` must be covered by another type when it appears before
             // the first local type (`dyn Trait`).
+            #[automatically_derived]
             unsafe impl #impl_generics turbo_tasks::Upcast<::std::boxed::Box<dyn #trait_path>> for #ty #where_clause {}
+            #[automatically_derived]
             unsafe impl #impl_generics turbo_tasks::UpcastStrict<::std::boxed::Box<dyn #trait_path>> for #ty #where_clause {}
 
             impl #impl_generics #trait_path for #ty #where_clause {

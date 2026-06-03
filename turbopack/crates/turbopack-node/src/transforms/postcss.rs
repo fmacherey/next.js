@@ -12,11 +12,11 @@ use turbo_tasks_fs::{
 };
 use turbopack_core::{
     asset::{Asset, AssetContent},
-    changed::any_content_changed_of_module,
+    changed::any_source_content_changed_of_module,
     context::{AssetContext, ProcessResult},
     file_source::FileSource,
     ident::AssetIdent,
-    module_graph::ModuleGraph,
+    module_graph::{ModuleGraph, SingleModuleGraph},
     reference_type::{EntryReferenceSubType, InnerAssets, ReferenceType},
     resolve::{FindContextFileResult, find_context_file_or_package_key, options::ImportMapping},
     source::Source,
@@ -60,9 +60,18 @@ struct PostCssProcessingResult {
     Decode,
 )]
 pub enum PostCssConfigLocation {
+    /// Searches for postcss config only starting from the project root directory.
+    /// Used for foreign code (node_modules) where per-directory configs should be ignored.
     #[default]
     ProjectPath,
+    /// Searches for postcss config starting from the project root directory first,
+    /// then falls back to searching from the CSS file's parent directory if not found
+    /// at the project root.
     ProjectPathOrLocalPath,
+    /// Searches for postcss config starting from the CSS file's parent directory first,
+    /// then falls back to the project root if not found locally. This allows per-directory
+    /// postcss.config.js files to override the project root config.
+    LocalPathOrProjectPath,
 }
 
 #[turbo_tasks::value(shared)]
@@ -75,31 +84,35 @@ pub struct PostCssTransformOptions {
 
 #[turbo_tasks::function]
 fn postcss_configs() -> Vc<Vec<RcStr>> {
-    Vc::cell(
-        [
-            ".postcssrc",
-            ".postcssrc.json",
-            ".postcssrc.yaml",
-            ".postcssrc.yml",
-            ".postcssrc.js",
-            ".postcssrc.mjs",
-            ".postcssrc.cjs",
-            ".config/postcssrc",
-            ".config/postcssrc.json",
-            ".config/postcssrc.yaml",
-            ".config/postcssrc.yml",
-            ".config/postcssrc.js",
-            ".config/postcssrc.mjs",
-            ".config/postcssrc.cjs",
-            "postcss.config.js",
-            "postcss.config.mjs",
-            "postcss.config.cjs",
-            "postcss.config.json",
-        ]
-        .into_iter()
-        .map(RcStr::from)
-        .collect(),
-    )
+    Vc::cell(vec![
+        rcstr!(".postcssrc"),
+        rcstr!(".postcssrc.json"),
+        rcstr!(".postcssrc.yaml"),
+        rcstr!(".postcssrc.yml"),
+        rcstr!(".postcssrc.js"),
+        rcstr!(".postcssrc.mjs"),
+        rcstr!(".postcssrc.cjs"),
+        rcstr!(".postcssrc.ts"),
+        rcstr!(".postcssrc.mts"),
+        rcstr!(".postcssrc.cts"),
+        rcstr!(".config/postcssrc"),
+        rcstr!(".config/postcssrc.json"),
+        rcstr!(".config/postcssrc.yaml"),
+        rcstr!(".config/postcssrc.yml"),
+        rcstr!(".config/postcssrc.js"),
+        rcstr!(".config/postcssrc.mjs"),
+        rcstr!(".config/postcssrc.cjs"),
+        rcstr!(".config/postcssrc.ts"),
+        rcstr!(".config/postcssrc.mts"),
+        rcstr!(".config/postcssrc.cts"),
+        rcstr!("postcss.config.js"),
+        rcstr!("postcss.config.mjs"),
+        rcstr!("postcss.config.cjs"),
+        rcstr!("postcss.config.ts"),
+        rcstr!("postcss.config.mts"),
+        rcstr!("postcss.config.cts"),
+        rcstr!("postcss.config.json"),
+    ])
 }
 
 #[turbo_tasks::value]
@@ -135,7 +148,11 @@ impl PostCssTransform {
 #[turbo_tasks::value_impl]
 impl SourceTransform for PostCssTransform {
     #[turbo_tasks::function]
-    fn transform(&self, source: ResolvedVc<Box<dyn Source>>) -> Vc<Box<dyn Source>> {
+    fn transform(
+        &self,
+        source: ResolvedVc<Box<dyn Source>>,
+        asset_context: ResolvedVc<Box<dyn AssetContext>>,
+    ) -> Vc<Box<dyn Source>> {
         Vc::upcast(
             PostCssTransformedAsset {
                 evaluate_context: self.evaluate_context,
@@ -143,6 +160,7 @@ impl SourceTransform for PostCssTransform {
                 execution_context: self.execution_context,
                 config_location: self.config_location,
                 source,
+                asset_context,
                 source_map: self.source_maps,
             }
             .cell(),
@@ -157,6 +175,7 @@ struct PostCssTransformedAsset {
     execution_context: ResolvedVc<ExecutionContext>,
     config_location: PostCssConfigLocation,
     source: ResolvedVc<Box<dyn Source>>,
+    asset_context: ResolvedVc<Box<dyn AssetContext>>,
     source_map: bool,
 }
 
@@ -165,6 +184,12 @@ impl Source for PostCssTransformedAsset {
     #[turbo_tasks::function]
     fn ident(&self) -> Vc<AssetIdent> {
         self.source.ident()
+    }
+
+    #[turbo_tasks::function]
+    async fn description(&self) -> Result<Vc<RcStr>> {
+        let inner = self.source.description().await?;
+        Ok(Vc::cell(format!("PostCSS transform of {}", inner).into()))
     }
 }
 
@@ -195,7 +220,7 @@ async fn config_changed(
         .module();
 
     Ok(Vc::<Completions>::cell(vec![
-        any_content_changed_of_module(config_asset)
+        any_source_content_changed_of_module(config_asset)
             .to_resolved()
             .await?,
         extra_configs_changed(asset_context, postcss_config_path)
@@ -231,9 +256,11 @@ async fn extra_configs_changed(
                         .try_into_module()
                         .await?
                     {
-                        Some(module) => {
-                            Some(any_content_changed_of_module(*module).to_resolved().await?)
-                        }
+                        Some(module) => Some(
+                            any_source_content_changed_of_module(*module)
+                                .to_resolved()
+                                .await?,
+                        ),
                         None => None,
                     }
                 } else {
@@ -274,12 +301,18 @@ impl JsonSource {
 #[turbo_tasks::value_impl]
 impl Source for JsonSource {
     #[turbo_tasks::function]
+    fn description(&self) -> Vc<RcStr> {
+        Vc::cell(format!("JSON content of {}", self.path).into())
+    }
+
+    #[turbo_tasks::function]
     async fn ident(&self) -> Result<Vc<AssetIdent>> {
         match &*self.key.await? {
             Some(key) => Ok(AssetIdent::from_path(
                 self.path.append(".")?.append(key)?.append(".json")?,
-            )),
-            None => Ok(AssetIdent::from_path(self.path.append(".json")?)),
+            )
+            .into_vc()),
+            None => Ok(AssetIdent::from_path(self.path.append(".json")?).into_vc()),
         }
     }
 }
@@ -312,7 +345,7 @@ impl Asset for JsonSource {
             FileSystemEntryType::NotFound => {
                 Ok(AssetContent::File(FileContent::NotFound.resolved_cell()).cell())
             }
-            _ => Err(anyhow::anyhow!("Invalid file type {:?}", file_type)),
+            _ => bail!("Invalid file type {:?}", file_type),
         }
     }
 }
@@ -409,22 +442,28 @@ async fn find_config_in_location(
     location: PostCssConfigLocation,
     source: Vc<Box<dyn Source>>,
 ) -> Result<Option<FileSystemPath>> {
-    if let FindContextFileResult::Found(config_path, _) =
-        &*find_context_file_or_package_key(project_path, postcss_configs(), rcstr!("postcss"))
-            .await?
-    {
-        return Ok(Some(config_path.clone()));
-    }
+    // Build an ordered list of directories to search based on the location strategy.
+    let search_paths = match location {
+        // Only check project root (used for foreign/node_modules code).
+        PostCssConfigLocation::ProjectPath => {
+            vec![project_path]
+        }
+        // Check project root first, fall back to the CSS file's directory.
+        PostCssConfigLocation::ProjectPathOrLocalPath => {
+            vec![project_path, source.ident().await?.path.parent()]
+        }
+        // Check the CSS file's directory first, fall back to the project root.
+        PostCssConfigLocation::LocalPathOrProjectPath => {
+            vec![source.ident().await?.path.parent(), project_path]
+        }
+    };
 
-    if matches!(location, PostCssConfigLocation::ProjectPathOrLocalPath)
-        && let FindContextFileResult::Found(config_path, _) = &*find_context_file_or_package_key(
-            source.ident().path().await?.parent(),
-            postcss_configs(),
-            rcstr!("postcss"),
-        )
-        .await?
-    {
-        return Ok(Some(config_path.clone()));
+    for path in search_paths {
+        if let FindContextFileResult::Found(config_path, _) =
+            &*find_context_file_or_package_key(path, postcss_configs(), rcstr!("postcss")).await?
+        {
+            return Ok(Some(config_path.clone()));
+        }
     }
 
     Ok(None)
@@ -434,7 +473,7 @@ async fn find_config_in_location(
 impl GenerateSourceMap for PostCssTransformedAsset {
     #[turbo_tasks::function]
     async fn generate_source_map(&self) -> Result<Vc<FileContent>> {
-        let source = Vc::try_resolve_sidecast::<Box<dyn GenerateSourceMap>>(*self.source).await?;
+        let source = ResolvedVc::try_sidecast::<Box<dyn GenerateSourceMap>>(self.source);
         match source {
             Some(source) => Ok(source.generate_source_map()),
             None => Ok(FileContent::NotFound.cell()),
@@ -450,6 +489,7 @@ impl PostCssTransformedAsset {
             project_path,
             chunking_context,
             env,
+            node_backend,
         } = &*self.execution_context.await?;
 
         // For this postcss transform, there is no guarantee that looking up for the
@@ -497,40 +537,53 @@ impl PostCssTransformedAsset {
         let postcss_executor =
             postcss_executor(*evaluate_context, project_path.clone(), config_path).module();
 
-        let entries = get_evaluate_entries(postcss_executor, *evaluate_context, None)
-            .to_resolved()
-            .await?;
+        let entries =
+            get_evaluate_entries(postcss_executor, *evaluate_context, **node_backend, None)
+                .to_resolved()
+                .await?;
 
-        let module_graph = ModuleGraph::from_modules(entries.graph_entries(), false, false)
-            .to_resolved()
-            .await?;
+        let module_graph = ModuleGraph::from_graphs(
+            vec![SingleModuleGraph::new_with_entries(
+                entries.graph_entries().to_resolved().await?,
+                false,
+                false,
+            )],
+            None,
+        )
+        .connect()
+        .to_resolved()
+        .await?;
 
-        let css_fs_path = self.source.ident().path();
+        let source_ident = self.source.ident().await?;
 
         // We need to get a path relative to the project because the postcss loader
         // runs with the project as the current working directory.
-        let css_path =
-            if let Some(css_path) = project_path.get_relative_path_to(&*css_fs_path.await?) {
-                css_path.into_owned()
-            } else {
-                // This shouldn't be an error since it can happen on virtual assets
-                "".into()
-            };
+        let css_path = if let Some(css_path) = project_path.get_relative_path_to(&source_ident.path)
+        {
+            css_path.into_owned()
+        } else {
+            // This shouldn't be an error since it can happen on virtual assets
+            "".into()
+        };
 
         let config_value = evaluate_webpack_loader(WebpackLoaderContext {
             entries,
             cwd: project_path.clone(),
             env: *env,
+            node_backend: *node_backend,
             context_source_for_issue: self.source,
             chunking_context: *chunking_context,
+            evaluate_context: self.evaluate_context,
             module_graph,
             resolve_options_context: None,
+            asset_context: self.asset_context,
             args: vec![
                 ResolvedVc::cell(content.into()),
                 ResolvedVc::cell(css_path.into()),
                 ResolvedVc::cell(source_map.into()),
             ],
             additional_invalidation: config_changed,
+            loader_names: vec![turbo_rcstr::rcstr!("postcss")],
         })
         .await?;
 

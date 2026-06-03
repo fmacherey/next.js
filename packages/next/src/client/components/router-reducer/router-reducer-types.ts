@@ -1,8 +1,5 @@
-import type { CacheNode } from '../../../shared/lib/app-router-types'
-import type {
-  FlightRouterState,
-  FlightSegmentPath,
-} from '../../../shared/lib/app-router-types'
+import type { CacheNode, ScrollRef } from '../../../shared/lib/app-router-types'
+import type { FlightRouterState } from '../../../shared/lib/app-router-types'
 import type { NavigationSeed } from '../segment-cache/navigation'
 import type { FetchServerResponseResult } from './fetch-server-response'
 
@@ -23,25 +20,6 @@ export type RouterChangeByServerResponse = ({
   serverResponse: FetchServerResponseResult
 }) => void
 
-export interface Mutable {
-  mpaNavigation?: boolean
-  patchedTree?: FlightRouterState
-  renderedSearch?: string
-  canonicalUrl?: string
-  scrollableSegments?: FlightSegmentPath[]
-  pendingPush?: boolean
-  cache?: CacheNode
-  hashFragment?: string
-  shouldScroll?: boolean
-  preserveCustomHistoryState?: boolean
-  onlyHashChange?: boolean
-  collectedDebugInfo?: Array<unknown>
-}
-
-export interface ServerActionMutable extends Mutable {
-  inFlightServerAction?: Promise<any> | null
-}
-
 /**
  * Refresh triggers a refresh of the full page data.
  * - fetches the Flight data and fills rsc at the root of the cache.
@@ -49,6 +27,12 @@ export interface ServerActionMutable extends Mutable {
  */
 export interface RefreshAction {
   type: typeof ACTION_REFRESH
+  /**
+   * Bypass invalidating the segment cache. Used by the Instant Navigation
+   * Testing API to preserve prefetched data when refreshing after an MPA
+   * navigation. Not exposed in production builds by default.
+   */
+  bypassCacheInvalidation?: boolean
 }
 
 export interface HmrRefreshAction {
@@ -107,7 +91,7 @@ export interface NavigateAction {
   isExternalUrl: boolean
   locationSearch: Location['search']
   navigateType: 'push' | 'replace'
-  shouldScroll: boolean
+  scrollBehavior: ScrollBehavior
 }
 
 /**
@@ -140,6 +124,7 @@ export interface ServerPatchAction {
   nextUrl: string | null
   seed: NavigationSeed | null
   mpa: boolean
+  navigateType: 'push' | 'replace'
 }
 
 /**
@@ -175,19 +160,37 @@ export interface PushRef {
   preserveCustomHistoryState: boolean
 }
 
+/**
+ * Controls the scroll behavior for a navigation.
+ */
+export const enum ScrollBehavior {
+  /** Use per-node ScrollRef to decide whether to scroll. */
+  Default = 0,
+  /** Suppress scroll entirely (e.g. scroll={false} on Link or router.push). */
+  NoScroll = 1,
+}
+
 export type FocusAndScrollRef = {
   /**
-   * If focus and scroll should be set in the layout-router's useEffect()
+   * The scroll ref from the most recent navigation. Set to whatever was
+   * accumulated during tree construction (or null if nothing was
+   * accumulated). On the next navigation, if new scroll targets are
+   * created, the previous scrollRef is invalidated by setting
+   * `current = false`.
    */
-  apply: boolean
+  scrollRef: ScrollRef | null
+  /**
+   * When true, the scroll handler uses `focusAndScrollRef.scrollRef`
+   * for every segment regardless of per-node state. Used for hash-only
+   * navigations where every segment should be treated as a scroll
+   * target. When false, the handler checks `cacheNode.scrollRef`
+   * instead (per-node), so only segments that actually navigated scroll.
+   */
+  forceScroll: boolean
   /**
    * The hash fragment that should be scrolled to.
    */
   hashFragment: string | null
-  /**
-   * The paths of the segments that should be focused.
-   */
-  segmentPaths: FlightSegmentPath[]
   /**
    * If only the URLs hash fragment changed
    */
@@ -222,7 +225,17 @@ export type AppRouterState = {
    * - This is the url you see in the browser.
    */
   canonicalUrl: string
+
+  /**
+   * The search query observed by the server during rendering. This may be
+   * different from the canonical URL's search query if the server performed
+   * a rewrite. Even though a client component won't observe this (unless it
+   * were passed from a Server component), the client router needs to know this
+   * so it can properly cache segment data; it'ss part of a page segment's
+   * cache key.
+   */
   renderedSearch: string
+
   /**
    * The underlying "url" representing the UI state, which is used for intercepting routes.
    */

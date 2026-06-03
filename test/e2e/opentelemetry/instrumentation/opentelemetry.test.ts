@@ -1,5 +1,5 @@
 import { isNextDev, nextTestSetup } from 'e2e-utils'
-import { check } from 'next-test-utils'
+import { check, retry } from 'next-test-utils'
 import { NEXT_RSC_UNION_QUERY } from 'next/dist/client/components/app-router-headers'
 
 import { SavedSpan } from './constants'
@@ -11,6 +11,7 @@ const EXTERNAL = {
 } as const
 
 const COLLECTOR_PORT = 9001
+const isStartMode = process.env.NEXT_TEST_MODE === 'start'
 
 describe('opentelemetry', () => {
   const { next, skipped, isNextDev } = nextTestSetup({
@@ -170,7 +171,7 @@ describe('opentelemetry', () => {
                       },
                       {
                         attributes: {
-                          'next.clientComponentLoadCount': isNextDev ? 7 : 6,
+                          'next.clientComponentLoadCount': isNextDev ? 8 : 7,
                           'next.span_type':
                             'NextNodeServer.clientComponentLoading',
                         },
@@ -578,7 +579,7 @@ describe('opentelemetry', () => {
                       },
                       {
                         attributes: {
-                          'next.clientComponentLoadCount': isNextDev ? 10 : 8,
+                          'next.clientComponentLoadCount': isNextDev ? 12 : 10,
                           'next.span_type':
                             'NextNodeServer.clientComponentLoading',
                         },
@@ -701,7 +702,7 @@ describe('opentelemetry', () => {
                       },
                       {
                         attributes: {
-                          'next.clientComponentLoadCount': isNextDev ? 7 : 6,
+                          'next.clientComponentLoadCount': isNextDev ? 9 : 8,
                           'next.span_type':
                             'NextNodeServer.clientComponentLoading',
                         },
@@ -1158,6 +1159,74 @@ describe('opentelemetry', () => {
     )
   }
 })
+;(process.env.__NEXT_CACHE_COMPONENTS ? describe.skip : describe)(
+  'opentelemetry NEXT_OTEL_VERBOSE=1',
+  () => {
+    const { next, skipped } = nextTestSetup({
+      files: __dirname,
+      skipDeployment: true,
+      dependencies: require('./package.json').dependencies,
+      env: {
+        TEST_OTEL_COLLECTOR_PORT: String(COLLECTOR_PORT),
+        NEXT_TELEMETRY_DISABLED: '1',
+        NEXT_OTEL_VERBOSE: '1',
+      },
+    })
+
+    if (skipped) {
+      return
+    }
+
+    let collector: Collector | undefined
+
+    beforeEach(async () => {
+      collector = await connectCollector({ port: COLLECTOR_PORT })
+    })
+
+    afterEach(async () => {
+      await collector?.shutdown()
+      collector = undefined
+    })
+
+    // Regression for https://github.com/vercel/otel/issues/107.
+    it('all spans (including verbose) inherit traceId from incoming traceparent header', async () => {
+      const pathname = '/app/param/rsc-fetch'
+      await next.fetch(pathname, {
+        headers: {
+          traceparent: `00-${EXTERNAL.traceId}-${EXTERNAL.spanId}-01`,
+        },
+      })
+
+      let spans: SavedSpan[] = []
+      await retry(async () => {
+        const all = collector?.getSpans() ?? []
+        const root = all.find(
+          (s) =>
+            s.attributes?.['next.span_type'] === 'BaseServer.handleRequest' &&
+            s.attributes?.['http.target'] === pathname
+        )
+        expect(root).toBeDefined()
+        expect(root!.traceId).toBe(EXTERNAL.traceId)
+
+        spans = all.filter((s) => s.traceId === root!.traceId)
+        expect(spans.length).toBeGreaterThan(1)
+
+        const verbose = spans.find(
+          (s) =>
+            s.attributes?.['next.span_type'] === 'NextServer.getRequestHandler'
+        )
+        expect(verbose).toBeDefined()
+        expect(verbose!.traceId).toBe(EXTERNAL.traceId)
+        const parentSpanId = verbose!.parentId
+        expect(parentSpanId).toBe(EXTERNAL.spanId)
+      })
+
+      for (const span of spans) {
+        expect(span.traceId).toBe(EXTERNAL.traceId)
+      }
+    })
+  }
+)
 
 describe('opentelemetry with disabled fetch tracing', () => {
   const { next, skipped } = nextTestSetup({
@@ -1380,7 +1449,7 @@ describe('opentelemetry with custom server', () => {
                   },
                   {
                     attributes: {
-                      'next.clientComponentLoadCount': isNextDev ? 7 : 6,
+                      'next.clientComponentLoadCount': isNextDev ? 8 : 7,
                       'next.span_type': 'NextNodeServer.clientComponentLoading',
                     },
                     kind: 0,
@@ -1418,6 +1487,134 @@ describe('opentelemetry with custom server', () => {
   })
 })
 
+if (isStartMode) {
+  describe('opentelemetry with direct entrypoint handler', () => {
+    const { next, skipped } = nextTestSetup({
+      files: __dirname,
+      skipDeployment: true,
+      dependencies: require('./package.json').dependencies,
+      startCommand: 'pnpm start-entrypoint',
+      packageJson: {
+        scripts: {
+          'start-entrypoint': 'pnpm tsx custom-entrypoint-server.ts',
+        },
+      },
+      serverReadyPattern: /- Local:/,
+      env: {
+        TEST_OTEL_COLLECTOR_PORT: String(COLLECTOR_PORT),
+        NEXT_TELEMETRY_DISABLED: '1',
+        NODE_ENV: 'production',
+      },
+    })
+
+    if (skipped) {
+      return
+    }
+
+    let collector: Collector
+
+    function getCollector(): Collector {
+      return collector
+    }
+
+    beforeEach(async () => {
+      collector = await connectCollector({ port: COLLECTOR_PORT })
+    })
+
+    afterEach(async () => {
+      await collector.shutdown()
+    })
+
+    const directEntrypointCases = [
+      { pathname: '/app/param/rsc-fetch', route: '/app/[param]/rsc-fetch' },
+      { pathname: '/api/app/param/data', route: '/api/app/[param]/data' },
+      {
+        pathname: '/pages/param/getServerSideProps',
+        route: '/pages/[param]/getServerSideProps',
+      },
+      {
+        pathname: '/api/pages/param/basic',
+        route: '/api/pages/[param]/basic',
+      },
+    ] as const
+
+    describe.each(directEntrypointCases)(
+      'direct entrypoint $pathname',
+      ({ pathname, route }) => {
+        it(`should add route names to handleRequest and parent spans for direct entrypoint ${pathname}`, async () => {
+          const response = await next.fetch(pathname)
+          expect(response.status).toBe(200)
+
+          await retry(
+            async () => {
+              const spans = collector.getSpans()
+              const handleRequestSpan = spans.find((span) => {
+                if (
+                  span.attributes?.['next.span_type'] !==
+                  'BaseServer.handleRequest'
+                ) {
+                  return false
+                }
+                const target = span.attributes?.['http.target'] as
+                  | string
+                  | undefined
+                return Boolean(target && target.includes(pathname))
+              })
+
+              expect(handleRequestSpan).toBeDefined()
+              expect(handleRequestSpan!.name).toBe(`GET ${route}`)
+              expect(handleRequestSpan!.attributes?.['http.target']).toContain(
+                pathname
+              )
+              expect(handleRequestSpan!.attributes?.['next.route']).toBe(route)
+              expect(handleRequestSpan!.attributes?.['http.route']).toBe(route)
+              expect(handleRequestSpan!.attributes?.['next.span_name']).toBe(
+                `GET ${route}`
+              )
+
+              const parentSpan = spans.find(
+                (span) =>
+                  span.traceId === handleRequestSpan!.traceId &&
+                  !span.parentId &&
+                  !span.attributes?.['next.span_type'] &&
+                  span.name === handleRequestSpan!.name
+              )
+              expect(parentSpan).toBeDefined()
+              expect(parentSpan!.name).toBe(`GET ${route}`)
+            },
+            30_000,
+            1_000,
+            `direct entrypoint span route naming ${pathname}`
+          )
+        })
+
+        it(`should propagate incoming context without next-server wrapper for direct entrypoint ${pathname}`, async () => {
+          const response = await next.fetch(pathname, {
+            headers: {
+              traceparent: `00-${EXTERNAL.traceId}-${EXTERNAL.spanId}-01`,
+            },
+          })
+          expect(response.status).toBe(200)
+
+          await expectTrace(getCollector(), [
+            {
+              name: `GET ${route}`,
+              traceId: EXTERNAL.traceId,
+              parentId: EXTERNAL.spanId,
+              attributes: {
+                'http.target': pathname,
+                'next.span_type': 'BaseServer.handleRequest',
+                'http.route': route,
+                'next.route': route,
+              },
+            },
+          ])
+        })
+      }
+    )
+  })
+}
+
 type HierSavedSpan = SavedSpan & { spans?: HierSavedSpan[] }
 type SpanMatch = Omit<Partial<HierSavedSpan>, 'spans'> & { spans?: SpanMatch[] }
 
@@ -1426,6 +1623,14 @@ async function expectTrace(
   match: SpanMatch[],
   edgeOnly?: boolean
 ) {
+  // Extract expected http.target values from the match to filter out extra spans
+  // that may be generated in production mode (e.g., RSC prefetch requests)
+  const expectedTargets = new Set(
+    match
+      .map((m) => m.attributes?.['http.target'] as string | undefined)
+      .filter(Boolean)
+  )
+
   await check(async () => {
     const traces = collector.getSpans()
 
@@ -1481,7 +1686,19 @@ async function expectTrace(
       })
     }
 
-    tree.sort((a, b) => {
+    // Filter root spans to only those matching expected http.target values
+    // This prevents flakiness from extra spans in prod mode (RSC prefetch, etc.)
+    const filteredTree =
+      expectedTargets.size > 0
+        ? tree.filter((span) => {
+            const target = span.attributes?.['http.target'] as
+              | string
+              | undefined
+            return target && expectedTargets.has(target)
+          })
+        : tree
+
+    filteredTree.sort((a, b) => {
       const runtimeDiff = (a.runtime ?? '').localeCompare(b.runtime ?? '')
       if (runtimeDiff !== 0) {
         return runtimeDiff
@@ -1489,7 +1706,7 @@ async function expectTrace(
       return a.name.localeCompare(b.name)
     })
 
-    expect(tree).toMatchObject(match)
+    expect(filteredTree).toMatchObject(match)
     return 'success'
   }, 'success')
 }

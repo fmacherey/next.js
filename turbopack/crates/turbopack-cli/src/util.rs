@@ -65,8 +65,11 @@ pub async fn project_fs(
     watch: bool,
     denied_root_path: RcStr,
 ) -> Result<Vc<Box<dyn FileSystem>>> {
-    let disk_fs =
-        DiskFileSystem::new_with_denied_path(rcstr!("project"), project_dir, denied_root_path);
+    let disk_fs = DiskFileSystem::new_with_denied_paths(
+        rcstr!("project"),
+        Vc::cell(project_dir),
+        vec![denied_root_path],
+    );
     if watch {
         disk_fs.await?.start_watching(None).await?;
     }
@@ -75,6 +78,6 @@ pub async fn project_fs(
 
 #[turbo_tasks::function]
 pub fn output_fs(project_dir: RcStr) -> Result<Vc<Box<dyn FileSystem>>> {
-    let disk_fs = DiskFileSystem::new(rcstr!("output"), project_dir);
+    let disk_fs = DiskFileSystem::new(rcstr!("output"), Vc::cell(project_dir));
     Ok(Vc::upcast(disk_fs))
 }

@@ -3,10 +3,10 @@ import { Suspense } from 'react'
 import { cachedDelay, DebugRenderKind } from '../../../shared'
 import { connection } from 'next/server'
 
-export const unstable_prefetch = {
-  mode: 'runtime',
-  samples: [{ headers: [['host', 'test-host']] }],
+export const unstable_instant = {
+  unstable_samples: [{ headers: [['host', 'test-host']] }],
 }
+export const unstable_prefetch = 'force-runtime'
 
 export default async function Page() {
   return (
