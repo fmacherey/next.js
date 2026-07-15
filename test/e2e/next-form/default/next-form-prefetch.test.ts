@@ -5,7 +5,6 @@ import {
   RSC_HEADER,
 } from 'next/src/client/components/app-router-headers'
 import type { Page, Request as PlaywrightRequest } from 'playwright'
-import { WebdriverOptions } from 'next-webdriver'
 import { retry } from 'next-test-utils'
 
 const _describe =
@@ -28,8 +27,8 @@ _describe('app dir - form prefetching', () => {
       requestFilter: async (request) => {
         // only capture RSC requests that *aren't* prefetches
         const headers = await request.allHeaders()
-        const isRSC = headers[RSC_HEADER.toLowerCase()] === '1'
-        const isPrefetch = !!headers[NEXT_ROUTER_PREFETCH_HEADER.toLowerCase()]
+        const isRSC = headers[RSC_HEADER] === '1'
+        const isPrefetch = !!headers[NEXT_ROUTER_PREFETCH_HEADER]
         return isRSC && !isPrefetch
       },
       log: true,
@@ -74,7 +73,7 @@ _describe('app dir - form prefetching', () => {
       requestFilter: async (request) => {
         // capture all RSC requests, prefetch or not
         const headers = await request.allHeaders()
-        const isRSC = headers[RSC_HEADER.toLowerCase()] === '1'
+        const isRSC = headers[RSC_HEADER] === '1'
         return isRSC
       },
       log: true,
@@ -131,7 +130,7 @@ _describe('app dir - form prefetching', () => {
 
 type PlaywrightRoutePattern = Parameters<Page['route']>[0]
 type PlaywrightRouteOptions = Parameters<Page['route']>[2]
-type BeforePageLoadFn = NonNullable<WebdriverOptions['beforePageLoad']>
+type BeforePageLoadFn = (page: Page) => void | Promise<void>
 
 type RequestInterceptorOptions = {
   pattern: PlaywrightRoutePattern

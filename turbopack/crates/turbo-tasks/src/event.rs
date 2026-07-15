@@ -1,5 +1,5 @@
 use std::{
-    fmt::{Debug, Formatter},
+    fmt::{Debug, Display, Formatter},
     future::Future,
     mem::replace,
     pin::Pin,
@@ -11,8 +11,61 @@ use std::{
     time::Duration,
 };
 
+use event_listener::Listener as _;
 #[cfg(feature = "hanging_detection")]
 use tokio::time::{Timeout, timeout};
+
+pub trait EventDescriptor {
+    #[cfg(feature = "hanging_detection")]
+    fn get_description(self) -> Arc<dyn Fn() -> String + Sync + Send>;
+}
+
+impl<T, InnerFn> EventDescriptor for T
+where
+    T: FnOnce() -> InnerFn,
+    InnerFn: Fn() -> String + Sync + Send + 'static,
+{
+    #[cfg(feature = "hanging_detection")]
+    fn get_description(self) -> Arc<dyn Fn() -> String + Sync + Send> {
+        Arc::new((self)())
+    }
+}
+
+#[derive(Clone)]
+pub struct EventDescription {
+    #[cfg(feature = "hanging_detection")]
+    description: Arc<dyn Fn() -> String + Sync + Send>,
+}
+
+impl EventDescription {
+    #[inline(always)]
+    pub fn new<InnerFn>(#[allow(unused_variables)] description: impl FnOnce() -> InnerFn) -> Self
+    where
+        InnerFn: Fn() -> String + Sync + Send + 'static,
+    {
+        Self {
+            #[cfg(feature = "hanging_detection")]
+            description: Arc::new((description)()),
+        }
+    }
+}
+
+impl Display for EventDescription {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        #[cfg(not(feature = "hanging_detection"))]
+        return write!(f, "");
+
+        #[cfg(feature = "hanging_detection")]
+        return write!(f, "{}", (self.description)());
+    }
+}
+
+impl EventDescriptor for EventDescription {
+    #[cfg(feature = "hanging_detection")]
+    fn get_description(self) -> Arc<dyn Fn() -> String + Sync + Send> {
+        self.description
+    }
+}
 
 pub struct Event {
     #[cfg(feature = "hanging_detection")]
@@ -35,17 +88,14 @@ impl Event {
     /// The outer closure allows avoiding extra lookups (e.g. task type info) that may be needed to
     /// capture information needed for constructing (moving into) the inner closure.
     #[inline(always)]
-    pub fn new<InnerFn>(_description: impl FnOnce() -> InnerFn) -> Self
-    where
-        InnerFn: Fn() -> String + Sync + Send + 'static,
-    {
+    pub fn new(#[allow(unused_variables)] description: impl EventDescriptor) -> Self {
         #[cfg(not(feature = "hanging_detection"))]
         return Self {
             event: event_listener::Event::new(),
         };
         #[cfg(feature = "hanging_detection")]
         return Self {
-            description: Arc::new((_description)()),
+            description: description.get_description(),
             event: event_listener::Event::new(),
         };
     }
@@ -61,10 +111,10 @@ impl Event {
             description: self.description.clone(),
             note: Arc::new(String::new),
             future: Some(Box::pin(timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 self.event.listen(),
             ))),
-            duration: Duration::from_secs(10),
+            duration: Duration::from_secs(30),
         };
     }
 
@@ -80,10 +130,7 @@ impl Event {
     ///
     /// The outer closure allow avoiding extra lookups (e.g. task type info) that may be needed to
     /// capture information needed for constructing (moving into) the inner closure.
-    pub fn listen_with_note<InnerFn>(&self, _note: impl FnOnce() -> InnerFn) -> EventListener
-    where
-        InnerFn: Fn() -> String + Sync + Send + 'static,
-    {
+    pub fn listen_with_note(&self, _note: impl EventDescriptor) -> EventListener {
         #[cfg(not(feature = "hanging_detection"))]
         return EventListener {
             listener: self.event.listen(),
@@ -91,12 +138,12 @@ impl Event {
         #[cfg(feature = "hanging_detection")]
         return EventListener {
             description: self.description.clone(),
-            note: Arc::new((_note)()),
+            note: _note.get_description(),
             future: Some(Box::pin(timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 self.event.listen(),
             ))),
-            duration: Duration::from_secs(10),
+            duration: Duration::from_secs(30),
         };
     }
 
@@ -155,6 +202,17 @@ impl Future for EventListener {
     }
 }
 
+#[cfg(not(feature = "hanging_detection"))]
+impl EventListener {
+    /// Blocks the current thread until the event is notified.
+    ///
+    /// This is the synchronous equivalent of `.await`-ing the `EventListener`.
+    /// Only valid in synchronous contexts (e.g. backend operations).
+    pub fn wait(self) {
+        self.listener.wait();
+    }
+}
+
 #[cfg(feature = "hanging_detection")]
 pub struct EventListener {
     description: Arc<dyn Fn() -> String + Sync + Send>,
@@ -193,12 +251,22 @@ impl Future for EventListener {
                     return Poll::Ready(());
                 }
                 Err(_) => {
-                    use crate::util::FormatDuration;
-                    eprintln!(
-                        "{:?} is potentially hanging (waiting for {})",
-                        self,
-                        FormatDuration(self.duration)
-                    );
+                    let note = (self.note)();
+                    let description = (self.description)();
+                    if note.is_empty() {
+                        eprintln!(
+                            "EventListener({}) is potentially hanging, waiting for {}s",
+                            description,
+                            self.duration.as_secs(),
+                        );
+                    } else {
+                        eprintln!(
+                            "EventListener({}) is potentially hanging, waiting for {}s from {}",
+                            description,
+                            self.duration.as_secs(),
+                            note
+                        );
+                    }
                     self.duration *= 2;
                     // SAFETY: Taking from Option is safe because the value is inside of a pinned
                     // Box. Pinning must continue until dropped.
@@ -214,6 +282,22 @@ impl Future for EventListener {
         }
         // EventListener was awaited again after completion
         Poll::Ready(())
+    }
+}
+
+#[cfg(feature = "hanging_detection")]
+impl EventListener {
+    /// Blocks the current thread until the event is notified.
+    ///
+    /// Note: In `hanging_detection` builds, timeout warnings are not emitted
+    /// for sync waits (only for async `.await` usage).
+    pub fn wait(mut self) {
+        if let Some(future) = self.future.take() {
+            // SAFETY: EventListener is Unpin, so it's safe to move out of the Pin.
+            unsafe { std::pin::Pin::into_inner_unchecked(future) }
+                .into_inner()
+                .wait();
+        }
     }
 }
 

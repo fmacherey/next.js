@@ -6,9 +6,11 @@ export const styles = css`
     --next-dialog-max-width: 960px;
     --next-dialog-row-padding: 16px;
     --next-dialog-padding: 12px;
-    --next-dialog-notch-height: 42px;
     --next-dialog-border-width: 1px;
 
+    background-color: var(--color-gray-100);
+    padding: 0 4px 4px 4px;
+    border-radius: var(--rounded-2xl);
     display: flex;
     flex-direction: column;
     width: 100%;
@@ -26,49 +28,10 @@ export const styles = css`
       opacity: 1;
       scale: 1;
     }
-
-    [data-nextjs-scroll-fader][data-side='top'] {
-      left: 1px;
-      top: calc(
-        var(--next-dialog-notch-height) + var(--next-dialog-border-width)
-      );
-      width: calc(100% - var(--next-dialog-padding));
-      opacity: 0;
-    }
   }
 
   [data-nextjs-dialog] {
     outline: 0;
-  }
-
-  [data-nextjs-dialog],
-  [data-nextjs-dialog] * {
-    &::-webkit-scrollbar {
-      width: 6px;
-      height: 6px;
-      border-radius: 0 0 1rem 1rem;
-      margin-bottom: 1rem;
-    }
-
-    &::-webkit-scrollbar-button {
-      display: none;
-    }
-
-    &::-webkit-scrollbar-track {
-      border-radius: 0 0 1rem 1rem;
-      background-color: var(--color-background-100);
-    }
-
-    &::-webkit-scrollbar-thumb {
-      border-radius: 1rem;
-      background-color: var(--color-gray-500);
-    }
-  }
-
-  /* Place overflow: hidden on this so we can break out from [data-nextjs-dialog] */
-  [data-nextjs-dialog-sizer] {
-    overflow: hidden;
-    border-radius: inherit;
   }
 
   [data-nextjs-dialog-backdrop] {
@@ -91,12 +54,16 @@ export const styles = css`
     display: flex;
     flex-direction: column;
     position: relative;
-    padding: var(--next-dialog-padding);
+    padding: 0;
   }
 
   [data-nextjs-dialog-content] > [data-nextjs-dialog-header] {
+    display: flex;
+    flex-direction: column;
     flex-shrink: 0;
+    gap: 4px;
     margin-bottom: 8px;
+    padding: 20px;
   }
 
   [data-nextjs-dialog-content] > [data-nextjs-dialog-body] {

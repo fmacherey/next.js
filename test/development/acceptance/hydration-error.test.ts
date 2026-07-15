@@ -1,10 +1,9 @@
 import { createSandbox } from 'development-sandbox'
-import { FileRef, nextTestSetup } from 'e2e-utils'
+import { FileRef, isReact18, nextTestSetup } from 'e2e-utils'
 import path from 'path'
 import { outdent } from 'outdent'
 import { getRedboxTotalErrorCount, retry } from 'next-test-utils'
 
-const isReact18 = parseInt(process.env.NEXT_TEST_REACT_VERSION) === 18
 // https://github.com/facebook/react/blob/main/packages/react-dom/src/__tests__/ReactDOMHydrationDiff-test.js used as a reference
 
 describe('Error overlay for hydration errors in Pages router', () => {
@@ -102,19 +101,19 @@ describe('Error overlay for hydration errors in Pages router', () => {
       await expect(browser).toDisplayRedbox(`
        {
          "componentStack": "...
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Mismatch} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Mismatch>
                          <div className="parent">
                            <main className="child">
        +                     client
        -                     server
                      ...",
-         "description": "Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:",
+         "description": "Hydration failed because the server rendered text didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:",
          "environmentLabel": null,
          "label": "Recoverable Error",
          "source": "index.js (5:9) @ Mismatch
@@ -141,7 +140,7 @@ describe('Error overlay for hydration errors in Pages router', () => {
     `
     )
 
-    await session.assertNoRedbox()
+    await session.waitForNoRedbox()
 
     expect(await browser.elementByCss('.child').text()).toBe('Value')
   })
@@ -207,12 +206,12 @@ describe('Error overlay for hydration errors in Pages router', () => {
       await expect(browser).toDisplayRedbox(`
        {
          "componentStack": "...
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Mismatch} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Mismatch>
                          <div className="parent">
        +                   <main className="only">
@@ -297,12 +296,12 @@ describe('Error overlay for hydration errors in Pages router', () => {
       await expect(browser).toDisplayRedbox(`
        {
          "componentStack": "...
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Mismatch} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Mismatch>
                          <div className="parent">
                            <header>
@@ -370,14 +369,14 @@ describe('Error overlay for hydration errors in Pages router', () => {
     } else {
       await expect(browser).toDisplayRedbox(`
        {
-         "componentStack": "<Root callbacks={[...]}>
-           <Head>
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Mismatch} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+         "componentStack": "<Next.js Internal Component>
+           <Next.js Internal Component>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Mismatch>
                          <div className="parent">
        -                   <main className="only">
@@ -440,14 +439,14 @@ describe('Error overlay for hydration errors in Pages router', () => {
     } else {
       await expect(browser).toDisplayRedbox(`
        {
-         "componentStack": "<Root callbacks={[...]}>
-           <Head>
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Mismatch} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+         "componentStack": "<Next.js Internal Component>
+           <Next.js Internal Component>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Mismatch>
                          <div className="parent">
        -                   only
@@ -532,11 +531,11 @@ describe('Error overlay for hydration errors in Pages router', () => {
       await expect(browser).toDisplayRedbox(`
        {
          "componentStack": "...
-           <Container fn={function fn}>
-             <PagesDevOverlayBridge>
-               <PagesDevOverlayErrorBoundary>
-                 <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                   <App pageProps={{}} Component={function Page} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
                      <Page>
                        <table>
                          <tbody>
@@ -617,14 +616,14 @@ describe('Error overlay for hydration errors in Pages router', () => {
     } else {
       await expect(browser).toDisplayRedbox(`
        {
-         "componentStack": "<Root callbacks={[...]}>
-           <Head>
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Page} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+         "componentStack": "<Next.js Internal Component>
+           <Next.js Internal Component>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Page>
        >                 <table>
        >                   {" 123"}
@@ -714,10 +713,10 @@ describe('Error overlay for hydration errors in Pages router', () => {
       await expect(browser).toDisplayRedbox(`
        {
          "componentStack": "...
-           <PagesDevOverlayBridge>
-             <PagesDevOverlayErrorBoundary>
-               <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                 <App pageProps={{}} Component={function Mismatch} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
                    <Mismatch>
                      <div className="parent">
                        <Suspense fallback={<p>}>
@@ -833,14 +832,14 @@ describe('Error overlay for hydration errors in Pages router', () => {
     } else {
       await expect(browser).toDisplayRedbox(`
        {
-         "componentStack": "<Root callbacks={[...]}>
-           <Head>
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Page} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+         "componentStack": "<Next.js Internal Component>
+           <Next.js Internal Component>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Page>
        >                 <p>
        >                   <p>
@@ -929,11 +928,11 @@ describe('Error overlay for hydration errors in Pages router', () => {
       await expect(browser).toDisplayRedbox(`
        {
          "componentStack": "...
-           <Container fn={function fn}>
-             <PagesDevOverlayBridge>
-               <PagesDevOverlayErrorBoundary>
-                 <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                   <App pageProps={{}} Component={function Page} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
                      <Page>
                        <div>
                          <div>
@@ -1011,14 +1010,14 @@ describe('Error overlay for hydration errors in Pages router', () => {
     } else {
       await expect(browser).toDisplayRedbox(`
        {
-         "componentStack": "<Root callbacks={[...]}>
-           <Head>
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Page} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+         "componentStack": "<Next.js Internal Component>
+           <Next.js Internal Component>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Page>
        >                 <div>
        >                   <tr>
@@ -1104,14 +1103,14 @@ describe('Error overlay for hydration errors in Pages router', () => {
     } else {
       await expect(browser).toDisplayRedbox(`
        {
-         "componentStack": "<Root callbacks={[...]}>
-           <Head>
-           <AppContainer>
-             <Container fn={function fn}>
-               <PagesDevOverlayBridge>
-                 <PagesDevOverlayErrorBoundary>
-                   <PathnameContextProviderAdapter router={{sdc:{},sbc:{}, ...}} isAutoExport={true}>
-                     <App pageProps={{}} Component={function Page} err={undefined} router={{sdc:{},sbc:{}, ...}}>
+         "componentStack": "<Next.js Internal Component>
+           <Next.js Internal Component>
+           <Next.js Internal Component>
+             <Next.js Internal Component>
+               <Next.js Internal Component>
+                 <Next.js Internal Component>
+                   <Next.js Internal Component>
+                     <Next.js Internal Component>
                        <Page>
        >                 <p>
                            <span>
@@ -1175,6 +1174,6 @@ describe('Error overlay for hydration errors in Pages router', () => {
     )
     const { session } = sandbox
     // FIXME: Should have a redbox just like with App router
-    await session.assertNoRedbox()
+    await session.waitForNoRedbox()
   })
 })

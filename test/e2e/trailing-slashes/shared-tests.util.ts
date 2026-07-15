@@ -3,10 +3,8 @@
 // These tests are defined here and used in `app-dir.test.ts` and
 // `pages-dir.test.ts` so that both test suites can be run in parallel.
 
-import type { Playwright } from 'next-webdriver'
-
 import cheerio from 'cheerio'
-import type { NextInstance } from 'e2e-utils'
+import type { NextInstance, Playwright } from 'e2e-utils'
 
 export function testShouldRedirect(
   next: NextInstance,
@@ -45,7 +43,9 @@ export function testShouldResolve(
       try {
         browser = await next.browser(route)
 
-        await browser.waitForElementByCss('#hydration-marker')
+        await browser.waitForElementByCss('#hydration-marker', {
+          state: 'attached',
+        })
         const text = await browser.elementByCss('#page-marker').text()
         expect(text).toBe(expectedPage)
         const routerPathname = await browser
@@ -92,7 +92,9 @@ export function testLinkShouldRewriteTo(
         browser = await next.browser(linkPage)
         await browser.elementByCss('#link').click()
 
-        await browser.waitForElementByCss('#hydration-marker')
+        await browser.waitForElementByCss('#hydration-marker', {
+          state: 'attached',
+        })
         const url = new URL(await browser.eval('window.location.href'))
         const pathname = url.href.slice(url.origin.length)
         expect(pathname).toBe(expectedHref)
@@ -110,7 +112,9 @@ export function testLinkShouldRewriteTo(
         browser = await next.browser(linkPage)
         await browser.elementByCss('#route-pusher').click()
 
-        await browser.waitForElementByCss('#hydration-marker')
+        await browser.waitForElementByCss('#hydration-marker', {
+          state: 'attached',
+        })
         const url = new URL(await browser.eval('window.location.href'))
         const pathname = url.href.slice(url.origin.length)
         expect(pathname).toBe(expectedHref)

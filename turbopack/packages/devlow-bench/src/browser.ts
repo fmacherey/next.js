@@ -32,7 +32,6 @@ async function withRequestMetrics(
         const url = response.request().url()
         const status = response.status()
         const extension =
-          // eslint-disable-next-line prefer-named-capture-group -- TODO: address lint
           /^[^?#]+\.([a-z0-9]+)(?:[?#]|$)/i.exec(url)?.[1] ?? 'none'
         const currentRequests = requestsByExtension.get(extension) ?? 0
         requestsByExtension.set(extension, currentRequests + 1)
@@ -174,7 +173,6 @@ function networkIdle(
 
     const fullTimeout = setTimeout(() => {
       cleanup()
-      // eslint-disable-next-line no-console -- logging
       console.error(
         `Timeout while waiting for network idle. These requests are still pending: ${Array.from(
           requests
@@ -210,7 +208,6 @@ function networkIdle(
       lastRequest = Date.now()
       const currentCount = requests.get(request.url())
       if (currentCount === undefined) {
-        // eslint-disable-next-line no-console -- basic logging
         console.error(
           `Unexpected untracked but completed request ${request.url()}`
         )
@@ -262,9 +259,17 @@ class BrowserSessionImpl implements BrowserSession {
     await withRequestMetrics(metricName, page, async () => {
       await measureTime(`${metricName}/start`)
       const idle = networkIdle(page, 3000)
-      await page.goto(url, {
+      const response = await page.goto(url, {
         waitUntil: 'commit',
       })
+      if (!response) {
+        throw new Error(`Navigation to ${url} produced no response`)
+      }
+      if (!response.ok()) {
+        throw new Error(
+          `Navigation to ${url} returned HTTP ${response.status()}`
+        )
+      }
       await measureTime(`${metricName}/html`, {
         relativeTo: `${metricName}/start`,
       })
@@ -321,9 +326,15 @@ class BrowserSessionImpl implements BrowserSession {
     await withRequestMetrics(metricName, page, async () => {
       await measureTime(`${metricName}/start`)
       const idle = networkIdle(page, 3000)
-      await page.reload({
+      const response = await page.reload({
         waitUntil: 'commit',
       })
+      if (!response) {
+        throw new Error('Reload produced no response')
+      }
+      if (!response.ok()) {
+        throw new Error(`Reload returned HTTP ${response.status()}`)
+      }
       await measureTime(`${metricName}/html`, {
         relativeTo: `${metricName}/start`,
       })
@@ -351,7 +362,7 @@ export async function newBrowserSession(options: {
 }): Promise<BrowserSession> {
   const browser = await chromium.launch({
     headless: options.headless ?? process.env.HEADLESS !== 'false',
-    devtools: true,
+    args: options.headless ? undefined : ['--auto-open-devtools-for-tabs'],
     timeout: 60000,
   })
   const context = await browser.newContext({

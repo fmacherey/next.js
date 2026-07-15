@@ -9,7 +9,8 @@ import '../require-hook'
 
 import url from 'url'
 import path from 'path'
-import loadConfig from '../config'
+import loadConfig, { type ConfiguredExperimentalFeature } from '../config'
+import { finalizeBundlerFromConfig, getBundlerFromEnv } from '../../lib/bundler'
 import { serveStatic } from '../serve-static'
 import setupDebug from 'next/dist/compiled/debug'
 import * as Log from '../../build/output/log'
@@ -30,6 +31,7 @@ import { parseUrl as parseUrlUtil } from '../../shared/lib/router/utils/parse-ur
 import {
   PHASE_PRODUCTION_SERVER,
   PHASE_DEVELOPMENT_SERVER,
+  REQUEST_INSIGHTS_DEV_ENDPOINT,
   UNDERSCORE_NOT_FOUND_ROUTE,
 } from '../../shared/lib/constants'
 import { RedirectStatusCode } from '../../client/components/redirect-status-code'
@@ -41,14 +43,14 @@ import { getHostname } from '../../shared/lib/get-hostname'
 import { detectDomainLocale } from '../../shared/lib/i18n/detect-domain-locale'
 import { MockedResponse } from './mock-request'
 import {
-  HMR_ACTIONS_SENT_TO_BROWSER,
-  type AppIsrManifestAction,
+  HMR_MESSAGE_SENT_TO_BROWSER,
+  type AppIsrManifestMessage,
 } from '../dev/hot-reloader-types'
 import { normalizedAssetPrefix } from '../../shared/lib/normalized-asset-prefix'
 import { NEXT_PATCH_SYMBOL } from './patch-fetch'
 import type { ServerInitResult } from './render-server'
 import { filterInternalHeaders } from './server-ipc/utils'
-import { blockCrossSite } from './router-utils/block-cross-site'
+import { blockCrossSiteDEV } from './router-utils/block-cross-site-dev'
 import { traceGlobals } from '../../trace/shared'
 import { NoFallbackError } from '../../shared/lib/no-fallback-error.external'
 import {
@@ -59,6 +61,11 @@ import {
   handleChromeDevtoolsWorkspaceRequest,
   isChromeDevtoolsWorkspaceUrl,
 } from './chrome-devtools-workspace'
+import { getNextConfigRuntime, type NextConfigComplete } from '../config-shared'
+import {
+  getRequestInsightsSnapshot,
+  isRequestInsightsEnabled,
+} from './trace/request-insights'
 
 const debug = setupDebug('next:router-server:main')
 const isNextFont = (pathname: string | null) =>
@@ -89,6 +96,7 @@ export async function initialize(opts: {
   keepAliveTimeout?: number
   customServer?: boolean
   experimentalHttpsServer?: boolean
+  serverFastRefresh?: boolean
   startServerSpan?: Span
   quiet?: boolean
 }): Promise<ServerInitResult> {
@@ -97,11 +105,26 @@ export async function initialize(opts: {
     process.env.NODE_ENV = opts.dev ? 'development' : 'production'
   }
 
+  // Capture the bundler before loading the config
+  const bundlerBeforeConfig = opts.dev ? getBundlerFromEnv() : undefined
+
+  let experimentalFeatures: ConfiguredExperimentalFeature[] = []
   const config = await loadConfig(
     opts.dev ? PHASE_DEVELOPMENT_SERVER : PHASE_PRODUCTION_SERVER,
     opts.dir,
-    { silent: false }
+    {
+      silent: false,
+      reportExperimentalFeatures(features) {
+        experimentalFeatures = features.toSorted(({ key: a }, { key: b }) =>
+          a.localeCompare(b)
+        )
+      },
+    }
   )
+
+  if (bundlerBeforeConfig !== undefined) {
+    finalizeBundlerFromConfig(bundlerBeforeConfig)
+  }
 
   let compress: ReturnType<typeof setupCompression> | undefined
 
@@ -118,9 +141,13 @@ export async function initialize(opts: {
 
   const renderServer: LazyRenderServerInstance = {}
 
-  let developmentBundler: DevBundler | undefined
-
-  let devBundlerService: DevBundlerService | undefined
+  let development:
+    | {
+        bundler: DevBundler
+        service: DevBundlerService
+        config: NextConfigComplete
+      }
+    | undefined = undefined
 
   let originalFetch = globalThis.fetch
 
@@ -146,7 +173,32 @@ export async function initialize(opts: {
     const setupDevBundlerSpan = opts.startServerSpan
       ? opts.startServerSpan.traceChild('setup-dev-bundler')
       : trace('setup-dev-bundler')
-    developmentBundler = await setupDevBundlerSpan.traceAsyncFn(() =>
+
+    // In development, it's always the complete config.
+    let developmentConfig = config as NextConfigComplete
+
+    // Resolve the effective serverFastRefresh value.
+    // Both default to enabled (true). CLI takes precedence over config.
+    const cliServerFastRefresh = opts.serverFastRefresh
+    const configServerFastRefresh =
+      developmentConfig.experimental?.turbopackServerFastRefresh
+    let effectiveServerFastRefresh: boolean | undefined
+    if (
+      cliServerFastRefresh !== undefined &&
+      configServerFastRefresh !== undefined &&
+      cliServerFastRefresh !== configServerFastRefresh
+    ) {
+      Log.warn(
+        `The CLI flag "${cliServerFastRefresh === false ? '--no-server-fast-refresh' : '--server-fast-refresh'}" conflicts with "experimental.turbopackServerFastRefresh: ${configServerFastRefresh}" in your Next.js config. The CLI flag will take precedence.`
+      )
+      effectiveServerFastRefresh = cliServerFastRefresh
+    } else {
+      // Default to true when neither CLI nor config specifies a value.
+      effectiveServerFastRefresh =
+        cliServerFastRefresh ?? configServerFastRefresh ?? true
+    }
+
+    let developmentBundler = await setupDevBundlerSpan.traceAsyncFn(() =>
       setupDevBundler({
         // Passed here but the initialization of this object happens below, doing the initialization before the setupDev call breaks.
         renderServer,
@@ -155,16 +207,17 @@ export async function initialize(opts: {
         telemetry,
         fsChecker,
         dir: opts.dir,
-        nextConfig: config,
+        nextConfig: developmentConfig,
         isCustomServer: opts.customServer,
         turbo: !!process.env.TURBOPACK,
         port: opts.port,
         onDevServerCleanup: opts.onDevServerCleanup,
         resetFetch,
+        serverFastRefresh: effectiveServerFastRefresh,
       })
     )
 
-    devBundlerService = new DevBundlerService(
+    let devBundlerService = new DevBundlerService(
       developmentBundler,
       // The request handler is assigned below, this allows us to create a lazy
       // reference to it.
@@ -172,15 +225,65 @@ export async function initialize(opts: {
         return requestHandlers[opts.dir](req, res)
       }
     )
+
+    development = {
+      bundler: developmentBundler,
+      service: devBundlerService,
+      config: developmentConfig,
+    }
   }
 
   renderServer.instance =
     require('./render-server') as typeof import('./render-server')
 
   const requestHandlerImpl: WorkerRequestHandler = async (req, res) => {
+    addRequestMeta(req, 'relativeProjectDir', relativeProjectDir)
+
     // internal headers should not be honored by the request handler
     if (!process.env.NEXT_PRIVATE_TEST_HEADERS) {
       filterInternalHeaders(req.headers)
+    }
+
+    if (opts.dev && req.url) {
+      if (config.experimental.requestInsights) {
+        process.env.__NEXT_REQUEST_INSIGHTS = 'true'
+      }
+
+      const urlParts = req.url.split('?', 1)
+      const pathname = removePathPrefix(urlParts[0] || '', config.basePath)
+
+      if (pathname === REQUEST_INSIGHTS_DEV_ENDPOINT) {
+        if (
+          development &&
+          blockCrossSiteDEV(
+            req,
+            res,
+            development.config.allowedDevOrigins,
+            opts.hostname
+          )
+        ) {
+          return
+        }
+
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        if (
+          !config.experimental.requestInsights &&
+          !isRequestInsightsEnabled()
+        ) {
+          res.statusCode = 404
+          res.end(
+            JSON.stringify({
+              error:
+                'Request Insights is not enabled. Set experimental.requestInsights = true and restart next dev.',
+            })
+          )
+          return
+        }
+
+        res.statusCode = 200
+        res.end(JSON.stringify(getRequestInsightsSnapshot()))
+        return
+      }
     }
 
     if (
@@ -303,7 +406,6 @@ export async function initialize(opts: {
           await initResult?.requestHandler(req, res)
         } catch (err) {
           if (err instanceof NoFallbackError) {
-            // eslint-disable-next-line
             await handleRequest(handleIndex + 1)
             return
           }
@@ -327,8 +429,15 @@ export async function initialize(opts: {
       }
 
       // handle hot-reloader first
-      if (developmentBundler) {
-        if (blockCrossSite(req, res, config.allowedDevOrigins, opts.hostname)) {
+      if (development) {
+        if (
+          blockCrossSiteDEV(
+            req,
+            res,
+            development.config.allowedDevOrigins,
+            opts.hostname
+          )
+        ) {
           return
         }
 
@@ -345,9 +454,9 @@ export async function initialize(opts: {
           req.url = removePathPrefix(origUrl, config.assetPrefix)
         }
 
-        const parsedUrl = url.parse(req.url || '/')
+        const parsedUrl = parseUrlUtil(req.url || '/')
 
-        const hotReloaderResult = await developmentBundler.hotReloader.run(
+        const hotReloaderResult = await development.bundler.hotReloader.run(
           req,
           res,
           parsedUrl
@@ -379,7 +488,7 @@ export async function initialize(opts: {
         return
       }
 
-      if (developmentBundler && matchedOutput?.type === 'devVirtualFsItem') {
+      if (development && matchedOutput?.type === 'devVirtualFsItem') {
         const origUrl = req.url || '/'
 
         if (config.basePath && pathHasPrefix(origUrl, config.basePath)) {
@@ -391,12 +500,12 @@ export async function initialize(opts: {
           req.url = removePathPrefix(origUrl, config.assetPrefix)
         }
 
-        if (resHeaders) {
+        if (resHeaders !== null) {
           for (const key of Object.keys(resHeaders)) {
             res.setHeader(key, resHeaders[key])
           }
         }
-        const result = await developmentBundler.requestHandler(req, res)
+        const result = await development.bundler.requestHandler(req, res)
 
         if (result.finished) {
           return
@@ -418,8 +527,10 @@ export async function initialize(opts: {
       })
 
       // apply any response headers from routing
-      for (const key of Object.keys(resHeaders || {})) {
-        res.setHeader(key, resHeaders[key])
+      if (resHeaders !== null) {
+        for (const key of Object.keys(resHeaders)) {
+          res.setHeader(key, resHeaders[key])
+        }
       }
 
       // handle redirect
@@ -471,8 +582,11 @@ export async function initialize(opts: {
           !res.getHeader('cache-control') &&
           matchedOutput.type === 'nextStaticFolder'
         ) {
-          if (opts.dev && !isNextFont(parsedUrl.pathname)) {
-            res.setHeader('Cache-Control', 'no-store, must-revalidate')
+          if (matchedOutput.itemPath.startsWith('/service-worker/')) {
+            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate')
+            res.setHeader('Service-Worker-Allowed', config.basePath || '/')
+          } else if (opts.dev && !isNextFont(parsedUrl.pathname)) {
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate')
           } else {
             res.setHeader(
               'Cache-Control',
@@ -483,14 +597,9 @@ export async function initialize(opts: {
         if (!(req.method === 'GET' || req.method === 'HEAD')) {
           res.setHeader('Allow', ['GET', 'HEAD'])
           res.statusCode = 405
-          return await invokeRender(
-            url.parse('/405', true),
-            '/405',
-            handleIndex,
-            {
-              invokeStatus: 405,
-            }
-          )
+          return await invokeRender(parseUrlUtil('/405'), '/405', handleIndex, {
+            invokeStatus: 405,
+          })
         }
 
         try {
@@ -549,7 +658,7 @@ export async function initialize(opts: {
             const invokeStatus = err.statusCode
             res.statusCode = err.statusCode
             return await invokeRender(
-              url.parse(invokePath, true),
+              parseUrlUtil(invokePath),
               invokePath,
               handleIndex,
               {
@@ -574,7 +683,8 @@ export async function initialize(opts: {
         )
       }
 
-      if (opts.dev && isChromeDevtoolsWorkspaceUrl(parsedUrl)) {
+      // We want the original pathname without any basePath or proxy rewrites.
+      if (development && isChromeDevtoolsWorkspaceUrl(req.url)) {
         await handleChromeDevtoolsWorkspaceRequest(res, opts, config)
         return
       }
@@ -585,6 +695,36 @@ export async function initialize(opts: {
         'private, no-cache, no-store, max-age=0, must-revalidate'
       )
 
+      let realRequestPathname = parsedUrl.pathname ?? ''
+      if (realRequestPathname) {
+        if (config.basePath) {
+          realRequestPathname = removePathPrefix(
+            realRequestPathname,
+            config.basePath
+          )
+        }
+        if (config.assetPrefix) {
+          realRequestPathname = removePathPrefix(
+            realRequestPathname,
+            config.assetPrefix
+          )
+        }
+        if (config.i18n) {
+          realRequestPathname = removePathPrefix(
+            realRequestPathname,
+            '/' + (getRequestMeta(req, 'locale') ?? '')
+          )
+        }
+      }
+      // For not found static assets, return plain text 404 instead of
+      // full HTML 404 pages to save bandwidth.
+      if (realRequestPathname.startsWith('/_next/static/')) {
+        res.statusCode = 404
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.end('Not Found')
+        return null
+      }
+
       // Short-circuit favicon.ico serving so that the 404 page doesn't get built as favicon is requested by the browser when loading any route.
       if (opts.dev && !matchedOutput && parsedUrl.pathname === '/favicon.ico') {
         res.statusCode = 404
@@ -593,7 +733,7 @@ export async function initialize(opts: {
       }
 
       const appNotFound = opts.dev
-        ? developmentBundler?.serverFields.hasAppNotFound
+        ? development?.bundler?.serverFields.hasAppNotFound
         : await fsChecker.getItem(UNDERSCORE_NOT_FOUND_ROUTE)
 
       res.statusCode = 404
@@ -628,7 +768,7 @@ export async function initialize(opts: {
           console.error(err)
         }
         res.statusCode = Number(invokeStatus)
-        return await invokeRender(url.parse(invokePath, true), invokePath, 0, {
+        return await invokeRender(parseUrlUtil(invokePath), invokePath, 0, {
           invokeStatus: res.statusCode,
         })
       } catch (err2) {
@@ -660,15 +800,21 @@ export async function initialize(opts: {
     dev: !!opts.dev,
     server: opts.server,
     serverFields: {
-      ...(developmentBundler?.serverFields || {}),
-      setIsrStatus: devBundlerService?.setIsrStatus.bind(devBundlerService),
+      ...(development?.bundler?.serverFields || {}),
+      setIsrStatus: development?.service?.setIsrStatus.bind(
+        development?.service
+      ),
     } satisfies ServerFields,
     experimentalTestProxy: !!config.experimental.testProxy,
     experimentalHttpsServer: !!opts.experimentalHttpsServer,
-    bundlerService: devBundlerService,
+    bundlerService: development?.service,
     startServerSpan: opts.startServerSpan,
     quiet: opts.quiet,
     onDevServerCleanup: opts.onDevServerCleanup,
+    distDir: config.distDir,
+    experimentalFeatures,
+    cacheComponents: config.cacheComponents,
+    partialPrefetching: config.partialPrefetching,
   }
   renderServerOpts.serverFields.routerServerHandler = requestHandlerImpl
 
@@ -683,7 +829,7 @@ export async function initialize(opts: {
   const relativeProjectDir = path.relative(process.cwd(), opts.dir)
 
   routerServerGlobal[RouterServerContextSymbol][relativeProjectDir] = {
-    nextConfig: config,
+    nextConfig: getNextConfigRuntime(config),
     hostname: handlers.server.hostname,
     revalidate: handlers.server.revalidate.bind(handlers.server),
     render404: handlers.server.render404.bind(handlers.server),
@@ -691,7 +837,16 @@ export async function initialize(opts: {
     logErrorWithOriginalStack: opts.dev
       ? handlers.server.logErrorWithOriginalStack.bind(handlers.server)
       : (err: unknown) => !opts.quiet && Log.error(err),
-    setIsrStatus: devBundlerService?.setIsrStatus.bind(devBundlerService),
+    setCacheStatus: config.cacheComponents
+      ? development?.service?.setCacheStatus.bind(development?.service)
+      : undefined,
+    setIsrStatus: development?.service?.setIsrStatus.bind(development?.service),
+    setReactDebugChannel: development?.config.experimental.reactDebugChannel
+      ? development?.service?.setReactDebugChannel.bind(development?.service)
+      : undefined,
+    sendErrorsToBrowser: development?.service?.sendErrorsToBrowser.bind(
+      development?.service
+    ),
   }
 
   const logError = async (
@@ -719,7 +874,7 @@ export async function initialize(opts: {
     opts,
     renderServer.instance,
     renderServerOpts,
-    developmentBundler?.ensureMiddleware
+    development?.bundler?.ensureMiddleware
   )
 
   const upgradeHandler: WorkerUpgradeHandler = async (req, socket, head) => {
@@ -733,9 +888,14 @@ export async function initialize(opts: {
         // console.error(_err);
       })
 
-      if (opts.dev && developmentBundler && req.url) {
+      if (opts.dev && development && req.url) {
         if (
-          blockCrossSite(req, socket, config.allowedDevOrigins, opts.hostname)
+          blockCrossSiteDEV(
+            req,
+            socket,
+            development.config.allowedDevOrigins,
+            opts.hostname
+          )
         ) {
           return
         }
@@ -756,23 +916,32 @@ export async function initialize(opts: {
         }
 
         const isHMRRequest = req.url.startsWith(
-          ensureLeadingSlash(`${hmrPrefix}/_next/webpack-hmr`)
+          ensureLeadingSlash(`${hmrPrefix}/_next/hmr`)
         )
 
         // only handle HMR requests if the basePath in the request
         // matches the basePath for the handler responding to the request
         if (isHMRRequest) {
-          return developmentBundler.hotReloader.onHMR(
+          return development.bundler.hotReloader.onHMR(
             req,
             socket,
             head,
-            (client) => {
-              client.send(
-                JSON.stringify({
-                  action: HMR_ACTIONS_SENT_TO_BROWSER.ISR_MANIFEST,
-                  data: devBundlerService?.appIsrManifest || {},
-                } satisfies AppIsrManifestAction)
-              )
+            (client, { isLegacyClient }) => {
+              if (isLegacyClient) {
+                // Only send the ISR manifest to legacy clients, i.e. Pages
+                // Router clients, or App Router clients that have Cache
+                // Components disabled. The ISR manifest is only used to inform
+                // the static indicator, which currently does not provide useful
+                // information if Cache Components is enabled due to its binary
+                // nature (i.e. it does not support showing info for partially
+                // static pages).
+                client.send(
+                  JSON.stringify({
+                    type: HMR_MESSAGE_SENT_TO_BROWSER.ISR_MANIFEST,
+                    data: development.service?.appIsrManifest || {},
+                  } satisfies AppIsrManifestMessage)
+                )
+              }
             }
           )
         }
@@ -785,12 +954,13 @@ export async function initialize(opts: {
           )
         },
       })
-      const { matchedOutput, parsedUrl } = await resolveRoutes({
-        req,
-        res,
-        isUpgradeReq: true,
-        signal: signalFromNodeResponse(socket),
-      })
+      const { finished, matchedOutput, parsedUrl, statusCode } =
+        await resolveRoutes({
+          req,
+          res,
+          isUpgradeReq: true,
+          signal: signalFromNodeResponse(socket),
+        })
 
       // TODO: allow upgrade requests to pages/app paths?
       // this was not previously supported
@@ -798,8 +968,12 @@ export async function initialize(opts: {
         return socket.end()
       }
 
-      if (parsedUrl.protocol) {
-        return await proxyRequest(req, socket, parsedUrl, head)
+      if (finished && parsedUrl.protocol) {
+        if (!statusCode) {
+          return await proxyRequest(req, socket, parsedUrl, head)
+        }
+
+        return socket.end()
       }
 
       // If there's no matched output, we don't handle the request as user's
@@ -815,7 +989,12 @@ export async function initialize(opts: {
     upgradeHandler,
     server: handlers.server,
     closeUpgraded() {
-      developmentBundler?.hotReloader?.close()
+      development?.bundler?.hotReloader?.close()
     },
+    distDir: config.distDir,
+    experimentalFeatures,
+    cacheComponents: config.cacheComponents,
+    partialPrefetching: config.partialPrefetching,
+    agentRules: config.agentRules,
   }
 }

@@ -3,22 +3,18 @@ use std::future::IntoFuture;
 use anyhow::Result;
 use either::Either;
 use turbo_tasks::{ReadRef, ResolvedVc, TryJoinIterExt, Vc};
-use turbopack_core::{
-    chunk::{ChunkItem, ChunkItems, batch_info},
-    output::OutputAsset,
-};
+use turbopack_core::chunk::{ChunkItem, ChunkItems, batch_info};
 
 use crate::chunk::{
-    CodeAndIds,
+    CodeModuleIdsAndPaths,
     batch::{EcmascriptChunkItemBatchGroup, EcmascriptChunkItemOrBatchWithAsyncInfo},
-    batch_group_code_and_ids, item_code_and_ids,
+    batch_group_code_module_ids_and_paths, item_code_module_ids_and_paths,
 };
 
 #[turbo_tasks::value(shared)]
 pub struct EcmascriptChunkContent {
     pub chunk_items: Vec<EcmascriptChunkItemOrBatchWithAsyncInfo>,
     pub batch_groups: Vec<ResolvedVc<EcmascriptChunkItemBatchGroup>>,
-    pub referenced_output_assets: Vec<ResolvedVc<Box<dyn OutputAsset>>>,
 }
 
 #[turbo_tasks::value_impl]
@@ -53,12 +49,14 @@ impl EcmascriptChunkContent {
 }
 
 impl EcmascriptChunkContent {
-    pub async fn chunk_item_code_and_ids(&self) -> Result<Vec<ReadRef<CodeAndIds>>> {
+    pub async fn chunk_item_code_module_ids_and_paths(
+        &self,
+    ) -> Result<Vec<ReadRef<CodeModuleIdsAndPaths>>> {
         batch_info(
             &self.batch_groups,
             &self.chunk_items,
-            |batch| batch_group_code_and_ids(batch).into_future(),
-            |item| item_code_and_ids(item.clone()).into_future(),
+            |batch| batch_group_code_module_ids_and_paths(batch).into_future(),
+            |item| item_code_module_ids_and_paths(item.clone()).into_future(),
         )
         .await
     }

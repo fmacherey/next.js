@@ -1,7 +1,11 @@
 import '../../server/web/globals'
-import { adapter, type NextRequestHint } from '../../server/web/adapter'
+import {
+  adapter,
+  type EdgeHandler,
+  type NextRequestHint,
+} from '../../server/web/adapter'
 import { IncrementalCache } from '../../server/lib/incremental-cache'
-import { initializeCacheHandlers } from '../../server/use-cache/handlers'
+import * as cacheHandlers from '../../server/use-cache/handlers'
 
 import Document from 'VAR_MODULE_DOCUMENT'
 import * as appMod from 'VAR_MODULE_APP'
@@ -13,37 +17,33 @@ declare const incrementalCacheHandler: any
 // OPTIONAL_IMPORT:* as userland500Page
 // OPTIONAL_IMPORT:incrementalCacheHandler
 
-// TODO: re-enable this once we've refactored to use implicit matches
-// const renderToHTML = undefined
-
 import RouteModule, {
   type PagesRouteHandlerContext,
 } from '../../server/route-modules/pages/module'
 import { WebNextRequest, WebNextResponse } from '../../server/base-http/web'
 
-import type { RequestData } from '../../server/web/types'
-import type { NextConfigComplete } from '../../server/config-shared'
 import type { NextFetchEvent } from '../../server/web/spec-extension/fetch-event'
 import type RenderResult from '../../server/render-result'
 import type { RenderResultMetadata } from '../../server/render-result'
-import { getTracer, SpanKind, type Span } from '../../server/lib/trace/tracer'
+import {
+  getTracer,
+  SpanKind,
+  SpanStatusCode,
+  type Span,
+} from '../../server/lib/trace/tracer'
 import { BaseServerSpan } from '../../server/lib/trace/constants'
+import { HTML_CONTENT_TYPE_HEADER } from '../../lib/constants'
+import type { RequestMeta } from '../../server/request-meta'
+import { toNodeOutgoingHttpHeaders } from '../../server/web/utils'
 
 // injected by the loader afterwards.
-declare const nextConfig: NextConfigComplete
 declare const pageRouteModuleOptions: any
 declare const errorRouteModuleOptions: any
 declare const user500RouteModuleOptions: any
-// INJECT:nextConfig
 // INJECT:pageRouteModuleOptions
 // INJECT:errorRouteModuleOptions
 // INJECT:user500RouteModuleOptions
-
-// Initialize the cache handlers interface.
-initializeCacheHandlers()
-
-// expose this for the route-module
-;(globalThis as any).nextConfig = nextConfig
+// INJECT_RAW:cacheHandlerImports
 
 const pageMod = {
   ...userlandPage,
@@ -54,6 +54,8 @@ const pageMod = {
       Document,
     },
     userland: userlandPage,
+    distDir: process.env.__NEXT_RELATIVE_DIST_DIR || '',
+    relativeProjectDir: process.env.__NEXT_RELATIVE_PROJECT_DIR || '',
   }),
 }
 
@@ -66,6 +68,8 @@ const errorMod = {
       Document,
     },
     userland: userlandErrorPage,
+    distDir: process.env.__NEXT_RELATIVE_DIST_DIR || '',
+    relativeProjectDir: process.env.__NEXT_RELATIVE_PROJECT_DIR || '',
   }),
 }
 
@@ -80,6 +84,8 @@ const error500Mod = userland500Page
           Document,
         },
         userland: userland500Page,
+        distDir: process.env.__NEXT_RELATIVE_DIST_DIR || '',
+        relativeProjectDir: process.env.__NEXT_RELATIVE_PROJECT_DIR || '',
       }),
     }
   : null
@@ -90,7 +96,7 @@ async function requestHandler(
   req: NextRequestHint,
   _event: NextFetchEvent
 ): Promise<Response> {
-  let srcPage = 'VAR_PAGE'
+  let srcPage = 'VAR_DEFINITION_PATHNAME'
 
   const relativeUrl = `${req.nextUrl.pathname}${req.nextUrl.search}`
   const baseReq = new WebNextRequest(req)
@@ -109,14 +115,19 @@ async function requestHandler(
     query,
     params,
     buildId,
+    nextConfig,
+    deploymentId,
     isNextDataRequest,
     buildManifest,
     prerenderManifest,
     reactLoadableManifest,
-    clientReferenceManifest,
     subresourceIntegrityManifest,
     dynamicCssManifest,
+    clientAssetToken,
   } = prepareResult
+
+  cacheHandlers.initializeCacheHandlers(nextConfig.cacheMaxMemorySize)
+  // INJECT_RAW:cacheHandlerRegistration
 
   const renderContext: PagesRouteHandlerContext = {
     page: srcPage,
@@ -125,7 +136,8 @@ async function requestHandler(
 
     sharedContext: {
       buildId,
-      deploymentId: process.env.NEXT_DEPLOYMENT_ID,
+      deploymentId,
+      clientAssetToken,
       customServer: undefined,
     },
 
@@ -143,10 +155,7 @@ async function requestHandler(
       ComponentMod: pageMod,
       pageConfig: pageMod.pageConfig,
       routeModule: pageMod.routeModule,
-      strictNextHead: nextConfig.experimental.strictNextHead ?? true,
-      canonicalBase: nextConfig.amp.canonicalBase || '',
       previewProps: prerenderManifest.preview,
-      ampOptimizerConfig: nextConfig.experimental.amp?.optimizer,
       basePath: nextConfig.basePath,
       assetPrefix: nextConfig.assetPrefix,
       images: nextConfig.images,
@@ -158,12 +167,6 @@ async function requestHandler(
       distDir: '',
       crossOrigin: nextConfig.crossOrigin ? nextConfig.crossOrigin : undefined,
       largePageDataBytes: nextConfig.experimental.largePageDataBytes,
-      // Only the `publicRuntimeConfig` key is exposed to the client side
-      // It'll be rendered as part of __NEXT_DATA__ on the client side
-      runtimeConfig:
-        Object.keys(nextConfig.publicRuntimeConfig).length > 0
-          ? nextConfig.publicRuntimeConfig
-          : undefined,
 
       isExperimentalCompile: nextConfig.experimental.isExperimentalCompile,
       // `htmlLimitedBots` is passed to server as serialized config in string format
@@ -174,7 +177,6 @@ async function requestHandler(
       buildManifest,
       subresourceIntegrityManifest,
       reactLoadableManifest,
-      clientReferenceManifest,
       dynamicCssManifest,
     },
   }
@@ -195,7 +197,7 @@ async function requestHandler(
     const headers = new Headers()
 
     // Set content type
-    const contentType = result.contentType || 'text/html; charset=utf-8'
+    const contentType = result.contentType || HTML_CONTENT_TYPE_HEADER
     headers.set('Content-Type', contentType)
 
     // Add metadata headers
@@ -270,6 +272,16 @@ async function requestHandler(
             'next.rsc': false,
           })
 
+          if (finalStatus && finalStatus >= 500) {
+            // For 5xx status codes: SHOULD be set to 'Error' span status.
+            // x-ref: https://opentelemetry.io/docs/specs/semconv/http/http-spans/#status
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+            })
+            // For span status 'Error', SHOULD set 'error.type' attribute.
+            span.setAttribute('error.type', finalStatus.toString())
+          }
+
           const rootSpanAttributes = tracer.getRootSpanAttributes()
           // We were unable to get attributes, probably OTEL is not enabled
           if (!rootSpanAttributes) {
@@ -299,7 +311,7 @@ async function requestHandler(
             })
             span.updateName(name)
           } else {
-            span.updateName(`${req.method} ${relativeUrl}`)
+            span.updateName(`${req.method} ${srcPage}`)
           }
         })
 
@@ -312,12 +324,18 @@ async function requestHandler(
         throw err
       }
 
-      await errRouteModule.onRequestError(baseReq, err, {
-        routerKind: 'Pages Router',
-        routePath: srcPage,
-        routeType: 'render',
-        revalidateReason: undefined,
-      })
+      const silenceLog = false
+      await errRouteModule.onRequestError(
+        baseReq,
+        err,
+        {
+          routerKind: 'Pages Router',
+          routePath: srcPage,
+          routeType: 'render',
+          revalidateReason: undefined,
+        },
+        silenceLog
+      )
 
       const errResult = await errRouteModule.render(
         // @ts-expect-error we don't type this for edge
@@ -342,13 +360,11 @@ async function requestHandler(
 
   const tracer = getTracer()
 
-  // TODO: activeSpan code path is for when wrapped by
-  // next-server can be removed when this is no longer used
   return tracer.withPropagatedContext(req.headers, () =>
     tracer.trace(
       BaseServerSpan.handleRequest,
       {
-        spanName: `${req.method} ${relativeUrl}`,
+        spanName: `${req.method} ${srcPage}`,
         kind: SpanKind.SERVER,
         attributes: {
           'http.method': req.method,
@@ -361,12 +377,60 @@ async function requestHandler(
   )
 }
 
-export default function nHandler(opts: { page: string; request: RequestData }) {
+const internalHandler: EdgeHandler = (opts) => {
   return adapter({
     ...opts,
     IncrementalCache,
     handler: requestHandler,
     incrementalCacheHandler,
     bypassNextUrl: true,
+    page: 'VAR_DEFINITION_PATHNAME',
   })
 }
+
+export async function handler(
+  request: Request,
+  ctx: {
+    waitUntil?: (prom: Promise<void>) => void
+    signal?: AbortSignal
+    requestMeta?: RequestMeta
+  }
+): Promise<Response> {
+  const result = await internalHandler({
+    request: {
+      url: request.url,
+      method: request.method,
+      headers: toNodeOutgoingHttpHeaders(request.headers),
+      nextConfig: {
+        basePath: process.env.__NEXT_BASE_PATH,
+        i18n: process.env.__NEXT_I18N_CONFIG as any,
+        trailingSlash: Boolean(process.env.__NEXT_TRAILING_SLASH),
+        experimental: {
+          cacheLife: process.env.__NEXT_CACHE_LIFE as any,
+          authInterrupts: Boolean(
+            process.env.__NEXT_EXPERIMENTAL_AUTH_INTERRUPTS
+          ),
+          clientParamParsingOrigins: process.env
+            .__NEXT_CLIENT_PARAM_PARSING_ORIGINS as any,
+        },
+      },
+      page: {
+        name: 'VAR_DEFINITION_PATHNAME',
+      },
+      body:
+        request.method !== 'GET' && request.method !== 'HEAD'
+          ? (request.body ?? undefined)
+          : undefined,
+      waitUntil: ctx.waitUntil,
+      requestMeta: ctx.requestMeta,
+      signal: ctx.signal || new AbortController().signal,
+    },
+  })
+
+  ctx.waitUntil?.(result.waitUntil)
+
+  return result.response
+}
+
+// backwards compat
+export default internalHandler

@@ -10,19 +10,16 @@ use std::{
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use turbo_rcstr::RcStr;
+use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{ReadConsistency, TurboTasks, UpdateInfo, Vc, util::FormatDuration};
 use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
 use turbo_tasks_fs::{
     DirectoryEntry, DiskFileSystem, FileContent, FileSystem, FileSystemPath, ReadGlobResult,
-    glob::Glob, register,
+    glob::{Glob, GlobOptions},
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    register();
-    include!(concat!(env!("OUT_DIR"), "/register_example_hash_glob.rs"));
-
     let tt = TurboTasks::new(TurboTasksBackend::new(
         BackendOptions::default(),
         noop_backing_storage(),
@@ -31,14 +28,14 @@ async fn main() -> Result<()> {
 
     let task = tt.spawn_root_task(|| {
         Box::pin(async {
-            let root = current_dir().unwrap().to_str().unwrap().into();
-            let disk_fs = DiskFileSystem::new("project".into(), root, vec![]);
+            let root = RcStr::from(current_dir().unwrap().to_str().unwrap());
+            let disk_fs = DiskFileSystem::new(rcstr!("project"), Vc::cell(root));
             disk_fs.await?.start_watching(None).await?;
 
             // Smart Pointer cast
             let fs: Vc<Box<dyn FileSystem>> = Vc::upcast(disk_fs);
             let input = fs.root().await?.join("crates")?;
-            let glob = Glob::new("**/*.rs".into());
+            let glob = Glob::new(rcstr!("**/*.rs"), GlobOptions::default());
             let glob_result = input.read_glob(glob);
             let dir_hash = hash_glob_result(glob_result);
             print_hash(dir_hash).await?;
@@ -66,9 +63,9 @@ pub fn empty_string() -> Vc<RcStr> {
 }
 
 #[turbo_tasks::function]
-async fn print_hash(dir_hash: Vc<RcStr>) -> Result<Vc<()>> {
+async fn print_hash(dir_hash: Vc<RcStr>) -> Result<()> {
     println!("DIR HASH: {}", dir_hash.await?.as_str());
-    Ok(Default::default())
+    Ok(())
 }
 
 #[turbo_tasks::function]

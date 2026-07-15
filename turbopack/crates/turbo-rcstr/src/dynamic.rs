@@ -3,59 +3,104 @@ use std::{num::NonZeroU8, ptr::NonNull};
 use triomphe::Arc;
 
 use crate::{
-    INLINE_TAG, INLINE_TAG_INIT, LEN_OFFSET, RcStr, TAG_MASK,
-    tagged_value::{MAX_INLINE_LEN, TaggedValue},
+    DYNAMIC_TAG, INLINE_TAG, INLINE_TAG_INIT, LEN_OFFSET, RcStr, STATIC_TAG, TAG_MASK,
+    is_atom_inlineable, tagged_value::TaggedValue,
 };
 
-pub(crate) struct PrehashedString {
-    pub value: String,
+/// Read-only header for atoms allocated in static storage by the `rcstr!`
+/// macro. The value lives for `'static`, so we store a `&'static str` rather
+/// than owning the bytes.
+pub struct StaticPrehashedString {
+    pub value: &'static str,
     /// This is not the actual `fxhash`, but rather it's a value that passed to
     /// `write_u64` of [rustc_hash::FxHasher].
     pub hash: u64,
 }
 
-pub unsafe fn cast(ptr: TaggedValue) -> *const PrehashedString {
-    ptr.get_ptr().cast()
+/// Heap-owned header for atoms held in an [`Arc`]. `Box<str>` instead of
+/// `String` because the contents are immutable — we save the `capacity` field
+/// (and a tag/padding byte vs the old `Payload` enum) per atom.
+///
+/// TODO: collapse the two allocations (this header + the boxed bytes) into a
+/// single [`triomphe::ThinArc`] so the hash and bytes share one allocation and
+/// the inline pointer in [`crate::RcStr`] is one word. That change would make
+/// `RcStr::from(String)` copy the bytes, which would invalidate the current
+/// "cheap `String -> RcStr -> String`" property — worth a separate evaluation.
+pub struct DynamicPrehashedString {
+    pub value: Box<str>,
+    pub hash: u64,
 }
 
-pub(crate) unsafe fn deref_from<'i>(ptr: TaggedValue) -> &'i PrehashedString {
-    unsafe { &*cast(ptr) }
+pub(crate) unsafe fn deref_static<'i>(ptr: TaggedValue) -> &'i StaticPrehashedString {
+    unsafe { &*(ptr.get_ptr() as *const StaticPrehashedString) }
+}
+
+pub(crate) unsafe fn deref_dynamic<'i>(ptr: TaggedValue) -> &'i DynamicPrehashedString {
+    unsafe { &*(ptr.get_ptr() as *const DynamicPrehashedString) }
 }
 
 /// Caller should call `forget` (or `clone`) on the returned `Arc`
-pub unsafe fn restore_arc(v: TaggedValue) -> Arc<PrehashedString> {
-    let ptr = v.get_ptr() as *const PrehashedString;
+pub unsafe fn restore_arc(v: TaggedValue) -> Arc<DynamicPrehashedString> {
+    let ptr = v.get_ptr() as *const DynamicPrehashedString;
     unsafe { Arc::from_raw(ptr) }
 }
 
 /// This can create any kind of [Atom], although this lives in the `dynamic`
 /// module.
 pub(crate) fn new_atom<T: AsRef<str> + Into<String>>(text: T) -> RcStr {
-    let len = text.as_ref().len();
-
-    if len < MAX_INLINE_LEN {
+    let text = text.as_ref();
+    if is_atom_inlineable(text) {
+        let len = text.len();
         // INLINE_TAG ensures this is never zero
         let tag = INLINE_TAG_INIT | ((len as u8) << LEN_OFFSET);
         let mut unsafe_data = TaggedValue::new_tag(tag);
         unsafe {
-            unsafe_data.data_mut()[..len].copy_from_slice(text.as_ref().as_bytes());
+            unsafe_data.data_mut()[..len].copy_from_slice(text.as_bytes());
         }
         return RcStr { unsafe_data };
     }
 
-    let hash = hash_bytes(text.as_ref().as_bytes());
+    let hash = hash_bytes(text.as_bytes());
 
-    let entry: Arc<PrehashedString> = Arc::new(PrehashedString {
+    let prehashed = DynamicPrehashedString {
+        // NOTE: This will capture as a Box<str> which will essentially
+        // `shrink_to_fit` the bytes.
         value: text.into(),
         hash,
-    });
-    let entry = Arc::into_raw(entry);
+    };
+    new_atom_from_prehashed(prehashed)
+}
 
-    let ptr: NonNull<PrehashedString> = unsafe {
+/// Construct a new dynamic RcStr from a DynamicPrehashedString
+pub(crate) fn new_atom_from_prehashed(prehashed: DynamicPrehashedString) -> RcStr {
+    let entry: Arc<DynamicPrehashedString> = Arc::new(prehashed);
+    let mut entry = Arc::into_raw(entry);
+    debug_assert!(0 == entry as u8 & TAG_MASK);
+    entry = ((entry as usize) | DYNAMIC_TAG as usize) as *mut DynamicPrehashedString;
+    let ptr: NonNull<DynamicPrehashedString> = unsafe {
         // Safety: Arc::into_raw returns a non-null pointer
         NonNull::new_unchecked(entry as *mut _)
     };
-    debug_assert!(0 == ptr.as_ptr() as u8 & TAG_MASK);
+
+    RcStr {
+        unsafe_data: TaggedValue::new_ptr(ptr),
+    }
+}
+
+#[inline(always)]
+pub(crate) const fn new_static_atom(string: &'static StaticPrehashedString) -> RcStr {
+    let entry = string as *const StaticPrehashedString;
+    const {
+        debug_assert!(align_of::<StaticPrehashedString>() >= 4);
+        // This must be 00, so that we don't have to remove the tag, which we can't since it would
+        // require pointer-integer casts in a const context.
+        debug_assert!(STATIC_TAG == 0b_00);
+    }
+    let ptr: NonNull<StaticPrehashedString> = unsafe {
+        // Safety: references always return a non-null pointers
+        NonNull::new_unchecked(entry as *mut _)
+    };
+
     RcStr {
         unsafe_data: TaggedValue::new_ptr(ptr),
     }
@@ -65,8 +110,8 @@ pub(crate) fn new_atom<T: AsRef<str> + Into<String>>(text: T) -> RcStr {
 /// This is primarily useful in constant contexts.
 #[doc(hidden)]
 pub(crate) const fn inline_atom(text: &str) -> Option<RcStr> {
-    let len = text.len();
-    if len < MAX_INLINE_LEN {
+    if is_atom_inlineable(text) {
+        let len = text.len();
         let tag = INLINE_TAG | ((len as u8) << LEN_OFFSET);
         let mut unsafe_data = TaggedValue::new_tag(NonZeroU8::new(tag).unwrap());
 
@@ -90,7 +135,7 @@ const SEED2: u64 = 0x13198a2e03707344;
 const PREVENT_TRIVIAL_ZERO_COLLAPSE: u64 = 0xa4093822299f31d0;
 
 #[inline]
-fn multiply_mix(x: u64, y: u64) -> u64 {
+const fn multiply_mix(x: u64, y: u64) -> u64 {
     #[cfg(target_pointer_width = "64")]
     {
         // We compute the full u64 x u64 -> u128 product, this is a single mul
@@ -131,6 +176,33 @@ fn multiply_mix(x: u64, y: u64) -> u64 {
     }
 }
 
+// Const compatible helper function to read a u64 from a byte array at a given
+// offset
+// SAFETY: The caller must ensure that `bytes.len() >= offset + 8`
+#[inline(always)]
+const unsafe fn read_u64_le(bytes: &[u8], offset: usize) -> u64 {
+    debug_assert!(offset + 8 <= bytes.len());
+    // Reinterpret the pointer as an array of length 8 at the given offset
+    // SAFETY: it is our callers responsibility to ensure the offset is in range
+    let array = unsafe { bytes.as_ptr().add(offset) } as *const [u8; 8];
+    // SAFETY: this dereference is safe since we started with a reference (non-null) and an in range
+    // offset (callers responsibility)
+    u64::from_le_bytes(unsafe { *array })
+}
+
+// Const compatible helper function to read a u32 from a byte array at a given
+// offset
+// SAFETY: The caller must ensure that `bytes.len() >= offset + 4`
+#[inline(always)]
+const unsafe fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    debug_assert!(offset + 4 <= bytes.len());
+    // SAFETY: it is our callers responsibility to ensure the offset is in range
+    let array = unsafe { bytes.as_ptr().add(offset) } as *const [u8; 4];
+    // SAFETY: this dereference is safe since we started with a reference (non-null) and an in range
+    // offset (callers responsibility)
+    u32::from_le_bytes(unsafe { *array })
+}
+
 /// Copied from `hash_bytes` of `rustc-hash`.
 ///
 /// See: https://github.com/rust-lang/rustc-hash/blob/dc5c33f1283de2da64d8d7a06401d91aded03ad4/src/lib.rs#L252-L297
@@ -149,7 +221,8 @@ fn multiply_mix(x: u64, y: u64) -> u64 {
 /// We don't bother avalanching here as we'll feed this hash into a
 /// multiplication after which we take the high bits, which avalanches for us.
 #[inline]
-fn hash_bytes(bytes: &[u8]) -> u64 {
+#[doc(hidden)]
+pub const fn hash_bytes(bytes: &[u8]) -> u64 {
     let len = bytes.len();
     let mut s0 = SEED1;
     let mut s1 = SEED2;
@@ -157,11 +230,13 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     if len <= 16 {
         // XOR the input into s0, s1.
         if len >= 8 {
-            s0 ^= u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            s1 ^= u64::from_le_bytes(bytes[len - 8..].try_into().unwrap());
+            // SAFETY: we just checked that len is `>= 8` so these offsets are in range
+            s0 ^= unsafe { read_u64_le(bytes, 0) };
+            s1 ^= unsafe { read_u64_le(bytes, len - 8) };
         } else if len >= 4 {
-            s0 ^= u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as u64;
-            s1 ^= u32::from_le_bytes(bytes[len - 4..].try_into().unwrap()) as u64;
+            // SAFETY: we just checked that len is `>= 4` so these offsets are in range
+            s0 ^= unsafe { read_u32_le(bytes, 0) } as u64;
+            s1 ^= unsafe { read_u32_le(bytes, len - 4) } as u64;
         } else if len > 0 {
             let lo = bytes[0];
             let mid = bytes[len / 2];
@@ -173,8 +248,10 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
         // Handle bulk (can partially overlap with suffix).
         let mut off = 0;
         while off < len - 16 {
-            let x = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-            let y = u64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
+            // SAFETY: we just checked that `off >= 16`` away from the end
+            // so these offsets are in range.
+            let x = unsafe { read_u64_le(bytes, off) };
+            let y = unsafe { read_u64_le(bytes, off + 8) };
 
             // Replace s1 with a mix of s0, x, and y, and s0 with s1.
             // This ensures the compiler can unroll this loop into two
@@ -188,9 +265,10 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
             off += 16;
         }
 
-        let suffix = &bytes[len - 16..];
-        s0 ^= u64::from_le_bytes(suffix[0..8].try_into().unwrap());
-        s1 ^= u64::from_le_bytes(suffix[8..16].try_into().unwrap());
+        // SAFETY:At this point `len >16` so both these sutractions are >0 and more than 8 away from
+        // the end.`
+        s0 ^= unsafe { read_u64_le(bytes, len - 16) };
+        s1 ^= unsafe { read_u64_le(bytes, len - 8) };
     }
 
     multiply_mix(s0, s1) ^ (len as u64)

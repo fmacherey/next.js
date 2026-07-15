@@ -18,21 +18,44 @@ import {
   ACTION_RENDERING_INDICATOR_HIDE,
   ACTION_RENDERING_INDICATOR_SHOW,
   ACTION_DEVTOOL_UPDATE_ROUTE_STATE,
+  ACTION_DEVTOOLS_CONFIG,
+  type OverlayState,
+  type DispatcherEvent,
+  ACTION_CACHE_INDICATOR,
+  ACTION_INSTANT_NAVS_TOGGLE,
+  ACTION_REQUEST_INSIGHTS_SNAPSHOT,
+  ACTION_REQUEST_INSIGHTS_UPDATE,
 } from './dev-overlay/shared'
 
-import { startTransition, useInsertionEffect } from 'react'
+import type { FlightRouterState } from '../shared/lib/app-router-types'
+import {
+  createContext,
+  startTransition,
+  useContext,
+  useEffect,
+  useInsertionEffect,
+  useLayoutEffect,
+  type ActionDispatch,
+} from 'react'
 import { createRoot } from 'react-dom/client'
-import { FontStyles } from './dev-overlay/font/font-styles'
+import type { CacheIndicatorState } from './dev-overlay/cache-indicator'
 import type { HydrationErrorState } from './shared/hydration-error'
 import type { DebugInfo } from './shared/types'
-import { DevOverlay } from './dev-overlay/dev-overlay'
 import type { DevIndicatorServerState } from '../server/dev/dev-indicator-server-state'
 import type { VersionInfo } from '../server/dev/parse-version-info'
 import {
   insertSegmentNode,
   removeSegmentNode,
+  getSegmentTrieRoot,
 } from './dev-overlay/segment-explorer-trie'
 import type { SegmentNodeState } from './userspace/app/segment-explorer-node'
+import type { DevToolsConfig } from './dev-overlay/shared'
+import type { SegmentTrieData } from '../shared/lib/mcp-page-metadata-types'
+import { EventQueue } from './dev-overlay/event-queue'
+import type {
+  RequestInsight,
+  RequestInsightsSnapshot,
+} from './shared/request-insights'
 
 export interface Dispatcher {
   onBuildOk(): void
@@ -41,8 +64,10 @@ export interface Dispatcher {
   onDebugInfo(debugInfo: DebugInfo): void
   onBeforeRefresh(): void
   onRefresh(): void
-  onStaticIndicator(status: boolean): void
+  onCacheIndicator(status: CacheIndicatorState): void
+  onStaticIndicator(status: 'pending' | 'static' | 'dynamic' | 'disabled'): void
   onDevIndicator(devIndicator: DevIndicatorServerState): void
+  onDevToolsConfig(config: DevToolsConfig): void
   onUnhandledError(reason: Error): void
   onUnhandledRejection(reason: Error): void
   openErrorOverlay(): void
@@ -54,12 +79,59 @@ export interface Dispatcher {
   renderingIndicatorShow(): void
   segmentExplorerNodeAdd(nodeState: SegmentNodeState): void
   segmentExplorerNodeRemove(nodeState: SegmentNodeState): void
-  segmentExplorerUpdateRouteState(page: string): void
+  segmentExplorerUpdateRouteState(
+    page: string,
+    tree: FlightRouterState | null
+  ): void
+  instantNavsToggle(): void
+  onRequestInsightsSnapshot(snapshot: RequestInsightsSnapshot): void
+  onRequestInsightsUpdate(insight: RequestInsight): void
 }
 
 type Dispatch = ReturnType<typeof useErrorOverlayReducer>[1]
-let maybeDispatch: Dispatch | null = null
-const queue: Array<(dispatch: Dispatch) => void> = []
+const eventQueue = new EventQueue<Dispatch>()
+
+function loadDevOverlayUX() {
+  const { DevOverlay, FontStyles } =
+    require('./dev-overlay-ux') as typeof import('./dev-overlay-ux')
+  return { DevOverlay, FontStyles }
+}
+
+// Global state store for accessing current overlay state from outside React context
+type OverlayStateWithRouter = OverlayState & { routerType: 'pages' | 'app' }
+
+let currentOverlayState: OverlayStateWithRouter | null = null
+
+export function getSerializedOverlayState(): OverlayStateWithRouter | null {
+  // Serialize error objects properly since Error properties are non-enumerable
+  // This is used when sending state via HMR/JSON.stringify
+  if (!currentOverlayState) return null
+
+  return {
+    ...currentOverlayState,
+    errors: currentOverlayState.errors.map((errorEvent: any) => ({
+      ...errorEvent,
+      error: errorEvent.error
+        ? {
+            name: errorEvent.error.name,
+            message: errorEvent.error.message,
+            stack: errorEvent.error.stack,
+          }
+        : null,
+    })),
+  }
+}
+
+export function getSegmentTrieData(): SegmentTrieData | null {
+  if (!currentOverlayState) {
+    return null
+  }
+  const trieRoot = getSegmentTrieRoot()
+  return {
+    segmentTrie: trieRoot,
+    routerType: currentOverlayState.routerType,
+  }
+}
 
 // Events might be dispatched before we get a `dispatch` from React (e.g. console.error during module eval).
 // We need to queue them until we have a `dispatch` function available.
@@ -67,13 +139,9 @@ function createQueuable<Args extends any[]>(
   queueableFunction: (dispatch: Dispatch, ...args: Args) => void
 ) {
   return (...args: Args) => {
-    if (maybeDispatch) {
-      queueableFunction(maybeDispatch, ...args)
-    } else {
-      queue.push((dispatch: Dispatch) => {
-        queueableFunction(dispatch, ...args)
-      })
-    }
+    eventQueue.enqueue((dispatch) => {
+      queueableFunction(dispatch, ...args)
+    })
   }
 }
 
@@ -96,15 +164,30 @@ export const dispatcher: Dispatcher = {
       dispatch({ type: ACTION_VERSION_INFO, versionInfo })
     }
   ),
-  onStaticIndicator: createQueuable((dispatch: Dispatch, status: boolean) => {
-    dispatch({ type: ACTION_STATIC_INDICATOR, staticIndicator: status })
-  }),
+  onCacheIndicator: createQueuable(
+    (dispatch: Dispatch, status: CacheIndicatorState) => {
+      dispatch({ type: ACTION_CACHE_INDICATOR, cacheIndicator: status })
+    }
+  ),
+  onStaticIndicator: createQueuable(
+    (
+      dispatch: Dispatch,
+      status: 'pending' | 'static' | 'dynamic' | 'disabled'
+    ) => {
+      dispatch({ type: ACTION_STATIC_INDICATOR, staticIndicator: status })
+    }
+  ),
   onDebugInfo: createQueuable((dispatch: Dispatch, debugInfo: DebugInfo) => {
     dispatch({ type: ACTION_DEBUG_INFO, debugInfo })
   }),
   onDevIndicator: createQueuable(
     (dispatch: Dispatch, devIndicator: DevIndicatorServerState) => {
       dispatch({ type: ACTION_DEV_INDICATOR, devIndicator })
+    }
+  ),
+  onDevToolsConfig: createQueuable(
+    (dispatch: Dispatch, devToolsConfig: DevToolsConfig) => {
+      dispatch({ type: ACTION_DEVTOOLS_CONFIG, devToolsConfig })
     }
   ),
   onUnhandledError: createQueuable((dispatch: Dispatch, error: Error) => {
@@ -151,71 +234,111 @@ export const dispatcher: Dispatcher = {
     }
   ),
   segmentExplorerUpdateRouteState: createQueuable(
-    (dispatch: Dispatch, page: string) => {
-      dispatch({ type: ACTION_DEVTOOL_UPDATE_ROUTE_STATE, page })
+    (dispatch: Dispatch, page: string, tree: FlightRouterState | null) => {
+      dispatch({ type: ACTION_DEVTOOL_UPDATE_ROUTE_STATE, page, tree })
+    }
+  ),
+  instantNavsToggle: createQueuable((dispatch: Dispatch) => {
+    dispatch({ type: ACTION_INSTANT_NAVS_TOGGLE })
+  }),
+  onRequestInsightsSnapshot: createQueuable(
+    (dispatch: Dispatch, snapshot: RequestInsightsSnapshot) => {
+      dispatch({ type: ACTION_REQUEST_INSIGHTS_SNAPSHOT, snapshot })
+    }
+  ),
+  onRequestInsightsUpdate: createQueuable(
+    (dispatch: Dispatch, insight: RequestInsight) => {
+      dispatch({ type: ACTION_REQUEST_INSIGHTS_UPDATE, insight })
     }
   ),
 }
 
-function replayQueuedEvents(dispatch: NonNullable<typeof maybeDispatch>) {
-  try {
-    for (const queuedFunction of queue) {
-      queuedFunction(dispatch)
-    }
-  } finally {
-    // TODO: What to do with failed events?
-    queue.length = 0
-  }
-}
-
 function DevOverlayRoot({
-  getComponentStack,
+  enableCacheIndicator,
   getOwnerStack,
   getSquashedHydrationErrorDetails,
   isRecoverableError,
   routerType,
+  shadowRoot,
 }: {
-  getComponentStack: (error: Error) => string | undefined
+  enableCacheIndicator: boolean
   getOwnerStack: (error: Error) => string | null | undefined
   getSquashedHydrationErrorDetails: (error: Error) => HydrationErrorState | null
   isRecoverableError: (error: Error) => boolean
   routerType: 'app' | 'pages'
+  shadowRoot: ShadowRoot
 }) {
   const [state, dispatch] = useErrorOverlayReducer(
     routerType,
-    getComponentStack,
     getOwnerStack,
-    isRecoverableError
+    isRecoverableError,
+    enableCacheIndicator
   )
 
-  useInsertionEffect(() => {
-    maybeDispatch = dispatch
+  useEffect(() => {
+    currentOverlayState = { ...state, routerType }
+  }, [state, routerType])
 
+  useLayoutEffect(() => {
+    const portalNode = shadowRoot.host
+    if (state.theme === 'dark') {
+      portalNode.classList.add('dark')
+      portalNode.classList.remove('light')
+    } else if (state.theme === 'light') {
+      portalNode.classList.add('light')
+      portalNode.classList.remove('dark')
+    } else {
+      portalNode.classList.remove('dark')
+      portalNode.classList.remove('light')
+    }
+  }, [shadowRoot, state.theme])
+
+  useInsertionEffect(() => {
     // Can't schedule updates from useInsertionEffect, so we need to defer.
     // Could move this into a passive Effect but we don't want replaying when
     // we reconnect.
     const replayTimeout = setTimeout(() => {
-      replayQueuedEvents(dispatch)
+      eventQueue.connect(dispatch)
     })
 
     return () => {
-      maybeDispatch = null
+      eventQueue.disconnect(dispatch)
       clearTimeout(replayTimeout)
     }
   }, [])
+
+  if (process.env.__NEXT_DISABLE_DEV_OVERLAY_UX) {
+    return null
+  }
+
+  const { DevOverlay, FontStyles } = loadDevOverlayUX()
 
   return (
     <>
       {/* Fonts can only be loaded outside the Shadow DOM. */}
       <FontStyles />
-      <DevOverlay
-        state={state}
-        dispatch={dispatch}
-        getSquashedHydrationErrorDetails={getSquashedHydrationErrorDetails}
-      />
+      <DevOverlayContext
+        value={{
+          dispatch,
+          getSquashedHydrationErrorDetails,
+          shadowRoot,
+          state,
+        }}
+      >
+        <DevOverlay />
+      </DevOverlayContext>
     </>
   )
 }
+export const DevOverlayContext = createContext<{
+  shadowRoot: ShadowRoot
+  state: OverlayState & {
+    routerType: 'pages' | 'app'
+  }
+  dispatch: ActionDispatch<[action: DispatcherEvent]>
+  getSquashedHydrationErrorDetails: (error: Error) => HydrationErrorState | null
+}>(null!)
+export const useDevOverlayContext = () => useContext(DevOverlayContext)
 
 let isPagesMounted = false
 let isAppMounted = false
@@ -226,9 +349,9 @@ function getSquashedHydrationErrorDetailsApp() {
 }
 
 export function renderAppDevOverlay(
-  getComponentStack: (error: Error) => string | undefined,
   getOwnerStack: (error: Error) => string | null | undefined,
-  isRecoverableError: (error: Error) => boolean
+  isRecoverableError: (error: Error) => boolean,
+  enableCacheIndicator: boolean
 ): void {
   if (isPagesMounted) {
     // Switching between App and Pages Router is always a hard navigation
@@ -239,37 +362,46 @@ export function renderAppDevOverlay(
   }
 
   if (!isAppMounted) {
-    // React 19 will not throw away `<script>` elements in a container it owns.
-    // This ensures the actual user-space React does not unmount the Dev Overlay.
-    const script = document.createElement('script')
-    script.style.display = 'block'
-    // Although the style applied to the shadow host is isolated,
-    // the element that attached the shadow host (i.e. "script")
-    // is still affected by the parent's style (e.g. "body"). This may
-    // occur style conflicts like "display: flex", with other children
-    // elements therefore give the shadow host an absolute position.
-    script.style.position = 'absolute'
-    script.setAttribute('data-nextjs-dev-overlay', 'true')
-
+    const shouldRenderOverlay = !process.env.__NEXT_DISABLE_DEV_OVERLAY_UX
     const container = document.createElement('nextjs-portal')
 
-    script.appendChild(container)
-    document.body.appendChild(script)
+    if (shouldRenderOverlay) {
+      // React 19 will not throw away `<script>` elements in a container it owns.
+      // This ensures the actual user-space React does not unmount the Dev Overlay.
+      const script = document.createElement('script')
+      script.style.display = 'block'
+      // Although the style applied to the shadow host is isolated,
+      // the element that attached the shadow host (i.e. "script")
+      // is still affected by the parent's style (e.g. "body"). This may
+      // occur style conflicts like "display: flex", with other children
+      // elements therefore give the shadow host an absolute position.
+      script.style.position = 'absolute'
+      script.setAttribute('data-nextjs-dev-overlay', 'true')
+
+      script.appendChild(container)
+      document.body.appendChild(script)
+    }
 
     const root = createRoot(container, {
       identifierPrefix: 'ndt-',
+      // We don't have design for a default Transition indicator for the NDT frontend.
+      // So we disable React's built-in one to not conflict with the one for the actual Next.js app.
+      onDefaultTransitionIndicator: () => () => {},
     })
+
+    const shadowRoot = container.attachShadow({ mode: 'open' })
 
     startTransition(() => {
       // TODO: Dedicated error boundary or root error callbacks?
       // At least it won't unmount any user code if it errors.
       root.render(
         <DevOverlayRoot
-          getComponentStack={getComponentStack}
+          enableCacheIndicator={enableCacheIndicator}
           getOwnerStack={getOwnerStack}
           getSquashedHydrationErrorDetails={getSquashedHydrationErrorDetailsApp}
           isRecoverableError={isRecoverableError}
           routerType="app"
+          shadowRoot={shadowRoot}
         />
       )
     })
@@ -279,7 +411,6 @@ export function renderAppDevOverlay(
 }
 
 export function renderPagesDevOverlay(
-  getComponentStack: (error: Error) => string | undefined,
   getOwnerStack: (error: Error) => string | null | undefined,
   getSquashedHydrationErrorDetails: (
     error: Error
@@ -295,6 +426,7 @@ export function renderPagesDevOverlay(
   }
 
   if (!isPagesMounted) {
+    const shouldRenderOverlay = !process.env.__NEXT_DISABLE_DEV_OVERLAY_UX
     const container = document.createElement('nextjs-portal')
     // Although the style applied to the shadow host is isolated,
     // the element that attached the shadow host (i.e. "script")
@@ -306,34 +438,40 @@ export function renderPagesDevOverlay(
     // Pages Router runs with React 18 or 19 so we can't use the same trick as with
     // App Router. We just reconnect the container if React wipes it e.g. when
     // we recover from a shell error via createRoot()
-    new MutationObserver((records) => {
-      for (const record of records) {
-        if (record.type === 'childList') {
-          for (const node of record.removedNodes) {
-            if (node === container) {
-              // Reconnect the container to the body
-              document.body.appendChild(container)
+    if (shouldRenderOverlay) {
+      new MutationObserver((records) => {
+        for (const record of records) {
+          if (record.type === 'childList') {
+            for (const node of record.removedNodes) {
+              if (node === container) {
+                // Reconnect the container to the body
+                document.body.appendChild(container)
+              }
             }
           }
         }
-      }
-    }).observe(document.body, {
-      childList: true,
-    })
-    document.body.appendChild(container)
+      }).observe(document.body, {
+        childList: true,
+      })
+      document.body.appendChild(container)
+    }
 
-    const root = createRoot(container)
+    const root = createRoot(container, { identifierPrefix: 'ndt-' })
+
+    const shadowRoot = container.attachShadow({ mode: 'open' })
 
     startTransition(() => {
       // TODO: Dedicated error boundary or root error callbacks?
       // At least it won't unmount any user code if it errors.
       root.render(
         <DevOverlayRoot
-          getComponentStack={getComponentStack}
+          // Pages Router does not support Cache Components
+          enableCacheIndicator={false}
           getOwnerStack={getOwnerStack}
           getSquashedHydrationErrorDetails={getSquashedHydrationErrorDetails}
           isRecoverableError={isRecoverableError}
           routerType="pages"
+          shadowRoot={shadowRoot}
         />
       )
     })

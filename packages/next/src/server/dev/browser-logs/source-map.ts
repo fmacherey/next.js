@@ -1,9 +1,8 @@
-import type { StackFrame } from 'stacktrace-parser'
 import { getOriginalStackFrames as getOriginalStackFramesWebpack } from '../middleware-webpack'
 import { getOriginalStackFrames as getOriginalStackFramesTurbopack } from '../middleware-turbopack'
 import type { Project } from '../../../build/swc/types'
 import { dim } from '../../../lib/picocolors'
-import { parseStack } from '../../lib/parse-stack'
+import { parseStack, type StackFrame } from '../../lib/parse-stack'
 import path from 'path'
 import { LRUCache } from '../../lib/lru-cache'
 
@@ -244,8 +243,8 @@ export async function getSourceMappedStackFrames(
 function formatStackFrame(frame: StackFrame): string {
   const functionName = frame.methodName || '<anonymous>'
   const location =
-    frame.file && frame.lineNumber
-      ? `${frame.file}:${frame.lineNumber}${frame.column ? `:${frame.column}` : ''}`
+    frame.file && frame.line1
+      ? `${frame.file}:${frame.line1}${frame.column1 ? `:${frame.column1}` : ''}`
       : frame.file || '<unknown>'
 
   return `    at ${functionName} (${location})`
@@ -262,11 +261,8 @@ export const withLocation = async (
   },
   ctx: MappingContext,
   distDir: string,
-  config: boolean | { logDepth?: number; showSourceLocation?: boolean }
+  _config: boolean | 'error' | 'warn'
 ) => {
-  if (typeof config === 'object' && config.showSourceLocation === false) {
-    return original
-  }
   if (!stack) {
     return original
   }

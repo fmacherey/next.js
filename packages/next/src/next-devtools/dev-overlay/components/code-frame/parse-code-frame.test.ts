@@ -9,8 +9,8 @@ describe('parse line numbers', () => {
     const input = {
       stackFrame: {
         file: 'app/page.tsx',
-        lineNumber: 2,
-        column: 9,
+        line1: 2,
+        column1: 9,
         methodName: 'Page',
         arguments: [],
         ignored: false,
@@ -41,11 +41,11 @@ describe('parse line numbers', () => {
       isErroredLine: true,
     })
 
-    // Line of ^ marker
+    // Line of ^ marker — no line number on this line, return undefined.
     expect(
       parseLineNumberFromCodeFrameLine(decodedLines[2], input.stackFrame)
     ).toEqual({
-      lineNumber: '',
+      lineNumber: undefined,
       isErroredLine: false,
     })
   })
@@ -61,8 +61,8 @@ describe('parse line numbers', () => {
     const input = {
       stackFrame: {
         file: 'app/page.tsx',
-        lineNumber: 6,
-        column: 7,
+        line1: 6,
+        column1: 7,
         methodName: 'Page',
         arguments: [],
       },

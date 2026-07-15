@@ -111,6 +111,12 @@ const bundleTypes = {
   server: {
     server: path.join(__dirname, 'dist/esm/server/next-server.js'),
   },
+  'app-worker': {
+    'use-cache-probe-worker': path.join(
+      __dirname,
+      'dist/esm/server/dev/use-cache-probe-worker.js'
+    ),
+  },
 }
 
 /**
@@ -139,7 +145,7 @@ module.exports = ({ dev, turbo, bundleType, experimental, ...rest }) => {
         return
       }
 
-      if (request.endsWith('.external')) {
+      if (request.match(/\.external(\.js)?$/)) {
         const resolve = getResolve()
         const resolved = await resolve(context, request)
         const relative = path.relative(
@@ -162,7 +168,7 @@ module.exports = ({ dev, turbo, bundleType, experimental, ...rest }) => {
   const bundledReactChannel = experimental ? '-experimental' : ''
 
   const alias =
-    bundleType === 'app'
+    bundleType === 'app' || bundleType === 'app-worker'
       ? makeAppAliases({
           experimental,
           bundler: turbo ? 'turbopack' : 'webpack',
@@ -172,27 +178,44 @@ module.exports = ({ dev, turbo, bundleType, experimental, ...rest }) => {
   return {
     entry: bundleTypes[bundleType],
     target: 'node',
-    mode: dev ? 'development' : 'production',
+    mode:
+      process.env.NEXT_DEBUG_INTERNALS === 'true'
+        ? 'development'
+        : dev
+          ? 'development'
+          : 'production',
     output: {
       path: path.join(__dirname, 'dist/compiled/next-server'),
       filename: `[name]${turbo ? '-turbo' : ''}${
         experimental ? '-experimental' : ''
       }.runtime.${dev ? 'dev' : 'prod'}.js`,
-      libraryTarget: 'commonjs2',
+      library: {
+        type: 'commonjs2',
+      },
     },
     devtool: 'source-map',
-    optimization: {
-      moduleIds: 'named',
-      minimize: true,
-      concatenateModules: true,
-      minimizer: [
-        new webpack.SwcJsMinimizerRspackPlugin({
-          minimizerOptions: {
-            mangle: dev || process.env.NEXT_SERVER_NO_MANGLE ? false : true,
+    optimization:
+      process.env.NEXT_DEBUG_INTERNALS === 'true'
+        ? undefined
+        : {
+            moduleIds: 'named',
+            minimize: true,
+            concatenateModules: true,
+            minimizer: [
+              new webpack.SwcJsMinimizerRspackPlugin({
+                minimizerOptions: {
+                  compress: {
+                    defaults: true,
+                    // FIXME: compiler bug: wrongly merging two conditionals with different return values into one
+                    // (in `prepareValidationInputsInPartialPrefetching`)
+                    conditionals: false,
+                  },
+                  mangle:
+                    dev || process.env.NEXT_SERVER_NO_MANGLE ? false : true,
+                },
+              }),
+            ],
           },
-        }),
-      ],
-    },
     plugins: [
       new DevToolsIgnoreListPlugin({ shouldIgnorePath }),
       new webpack.DefinePlugin({
@@ -200,14 +223,20 @@ module.exports = ({ dev, turbo, bundleType, experimental, ...rest }) => {
         'process.env.NEXT_MINIMAL': JSON.stringify('true'),
         'this.serverOptions.experimentalTestProxy': JSON.stringify(false),
         'this.minimalMode': JSON.stringify(true),
-        'this.renderOpts.dev': JSON.stringify(dev),
-        'renderOpts.dev': JSON.stringify(dev),
+        // Only inline __NEXT_DEV_SERVER in prod bundles (for dead-code
+        // elimination). Dev bundles must keep it as a runtime check because
+        // they're shared between `next dev` (where it's set) and `next build
+        // --debug-prerender` (where it's not).
+        ...(dev ? {} : { 'process.env.__NEXT_DEV_SERVER': JSON.stringify('') }),
         'process.env.NODE_ENV': JSON.stringify(
           dev ? 'development' : 'production'
         ),
         'process.env.__NEXT_EXPERIMENTAL_REACT': JSON.stringify(
           experimental ? true : false
         ),
+        ...(bundleType === 'app' || bundleType === 'app-worker'
+          ? { 'process.env.__NEXT_USE_NODE_STREAMS': JSON.stringify(true) }
+          : {}),
         'process.env.NEXT_RUNTIME': JSON.stringify('nodejs'),
         'process.turbopack': JSON.stringify(turbo),
         'process.env.TURBOPACK': JSON.stringify(turbo),
@@ -246,7 +275,10 @@ module.exports = ({ dev, turbo, bundleType, experimental, ...rest }) => {
       rules: [
         { test: /\.m?js$/, loader: `source-map-loader`, enforce: `pre` },
         {
-          include: /[\\/]react-server\.node/,
+          include: [
+            /[\\/]react-server\.node/,
+            /server[\\/]dev[\\/]use-cache-probe-worker/,
+          ],
           layer: 'react-server',
         },
         {
@@ -288,9 +320,6 @@ module.exports = ({ dev, turbo, bundleType, experimental, ...rest }) => {
       externalsMap,
       externalHandler,
     ],
-    experiments: {
-      layers: true,
-    },
     ...rest,
   }
 }

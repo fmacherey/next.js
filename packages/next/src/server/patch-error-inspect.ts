@@ -3,16 +3,17 @@ import * as path from 'path'
 import * as url from 'url'
 import type * as util from 'util'
 import { SourceMapConsumer as SyncSourceMapConsumer } from 'next/dist/compiled/source-map'
-import type { StackFrame } from 'next/dist/compiled/stacktrace-parser'
 import {
   type ModernSourceMapPayload,
+  devirtualizeReactServerURL,
   findApplicableSourceMapPayload,
+  ignoreListAnonymousStackFramesIfSandwiched as ignoreListAnonymousStackFramesIfSandwichedGeneric,
   sourceMapIgnoreListsEverything,
 } from './lib/source-maps'
-import { parseStack } from './lib/parse-stack'
-import { getOriginalCodeFrame } from '../next-devtools/server/shared'
+import { parseStack, type StackFrame } from './lib/parse-stack'
+import type { IgnorableStackFrame } from '../next-devtools/server/shared'
 import { workUnitAsyncStorage } from './app-render/work-unit-async-storage.external'
-import { dim } from '../lib/picocolors'
+import { dim, italic } from '../lib/picocolors'
 
 type FindSourceMapPayload = (
   sourceURL: string
@@ -29,8 +30,29 @@ export function setBundlerFindSourceMapImplementation(
   bundlerFindSourceMapPayload = findSourceMapImplementation
 }
 
-interface IgnoreableStackFrame extends StackFrame {
-  ignored: boolean
+// Code frame renderer - injected by dev/build to avoid hard dependency on native bindings
+type CodeFrameRenderer = (
+  frame: IgnorableStackFrame,
+  source: string | null,
+  colors: boolean
+) => string | null
+
+let codeFrameRenderer: CodeFrameRenderer | undefined
+
+export function setCodeFrameRenderer(renderer: CodeFrameRenderer): void {
+  codeFrameRenderer = renderer
+}
+
+function getOriginalCodeFrame(
+  frame: IgnorableStackFrame,
+  source: string | null,
+  colors: boolean = process.stdout.isTTY
+): string | null {
+  if (!codeFrameRenderer) {
+    // No renderer available - gracefully degrade
+    return null
+  }
+  return codeFrameRenderer(frame, source, colors)
 }
 
 type SourceMapCache = Map<
@@ -38,31 +60,36 @@ type SourceMapCache = Map<
   null | { map: SyncSourceMapConsumer; payload: ModernSourceMapPayload }
 >
 
-function frameToString(frame: StackFrame): string {
-  let sourceLocation = frame.lineNumber !== null ? `:${frame.lineNumber}` : ''
-  if (frame.column !== null && sourceLocation !== '') {
-    sourceLocation += `:${frame.column}`
+function frameToString(
+  methodName: string | null,
+  sourceURL: string | null,
+  line1: number | null,
+  column1: number | null
+): string {
+  let sourceLocation = line1 !== null ? `:${line1}` : ''
+  if (column1 !== null && sourceLocation !== '') {
+    sourceLocation += `:${column1}`
   }
 
   let fileLocation: string | null
   if (
-    frame.file !== null &&
-    frame.file.startsWith('file://') &&
-    URL.canParse(frame.file)
+    sourceURL !== null &&
+    sourceURL.startsWith('file://') &&
+    URL.canParse(sourceURL)
   ) {
     // If not relative to CWD, the path is ambiguous to IDEs and clicking will prompt to select the file first.
     // In a multi-app repo, this leads to potentially larger file names but will make clicking snappy.
     // There's no tradeoff for the cases where `dir` in `next dev [dir]` is omitted
     // since relative to cwd is both the shortest and snappiest.
-    fileLocation = path.relative(process.cwd(), url.fileURLToPath(frame.file))
-  } else if (frame.file !== null && frame.file.startsWith('/')) {
-    fileLocation = path.relative(process.cwd(), frame.file)
+    fileLocation = path.relative(process.cwd(), url.fileURLToPath(sourceURL))
+  } else if (sourceURL !== null && sourceURL.startsWith('/')) {
+    fileLocation = path.relative(process.cwd(), sourceURL)
   } else {
-    fileLocation = frame.file
+    fileLocation = sourceURL
   }
 
-  return frame.methodName
-    ? `    at ${frame.methodName} (${fileLocation}${sourceLocation})`
+  return methodName
+    ? `    at ${methodName} (${fileLocation}${sourceLocation})`
     : `    at ${fileLocation}${sourceLocation}`
 }
 
@@ -99,7 +126,7 @@ interface SourcemappableStackFrame extends StackFrame {
 }
 
 interface SourceMappedFrame {
-  stack: IgnoreableStackFrame
+  stack: IgnorableStackFrame
   // DEV only
   code: string | null
 }
@@ -109,15 +136,32 @@ function createUnsourcemappedFrame(
 ): SourceMappedFrame {
   return {
     stack: {
-      arguments: frame.arguments,
-      column: frame.column,
       file: frame.file,
-      lineNumber: frame.lineNumber,
+      line1: frame.line1,
+      column1: frame.column1,
       methodName: frame.methodName,
+      arguments: frame.arguments,
       ignored: shouldIgnoreListGeneratedFrame(frame.file),
     },
     code: null,
   }
+}
+
+function ignoreListAnonymousStackFramesIfSandwiched(
+  sourceMappedFrames: Array<{
+    stack: IgnorableStackFrame
+    code: string | null
+  }>
+) {
+  return ignoreListAnonymousStackFramesIfSandwichedGeneric(
+    sourceMappedFrames,
+    (frame) => frame.stack.file === '<anonymous>',
+    (frame) => frame.stack.ignored,
+    (frame) => frame.stack.methodName,
+    (frame) => {
+      frame.stack.ignored = true
+    }
+  )
 }
 
 /**
@@ -130,7 +174,7 @@ function getSourcemappedFrameIfPossible(
   sourceMapCache: SourceMapCache,
   inspectOptions: util.InspectOptions
 ): {
-  stack: IgnoreableStackFrame
+  stack: IgnorableStackFrame
   code: string | null
 } {
   const sourceMapCacheEntry = sourceMapCache.get(frame.file)
@@ -138,10 +182,14 @@ function getSourcemappedFrameIfPossible(
   let sourceMapPayload: ModernSourceMapPayload
   if (sourceMapCacheEntry === undefined) {
     let sourceURL = frame.file
-    // e.g. "/APP/.next/server/chunks/ssr/[root-of-the-server]__2934a0._.js"
+    // e.g. "/Users/foo/APP/.next/server/chunks/ssr/[root-of-the-server]__2934a0._.js"
+    // or "C:\Users\foo\APP\.next\server\chunks\ssr\[root-of-the-server]__2934a0._.js"
     // will be keyed by Node.js as "file:///APP/.next/server/chunks/ssr/[root-of-the-server]__2934a0._.js".
     // This is likely caused by `callsite.toString()` in `Error.prepareStackTrace converting file URLs to paths.
-    if (sourceURL.startsWith('/')) {
+    //
+    // But frame.file might also be "webpack-internal:///(rsc)/./app/bad-sourcemap/page.js" or
+    // "<anonymous>" or "node:internal/process/task_queues" here
+    if (path.isAbsolute(frame.file)) {
       sourceURL = url.pathToFileURL(frame.file).toString()
     }
     let maybeSourceMapPayload: ModernSourceMapPayload | undefined
@@ -174,9 +222,20 @@ function getSourcemappedFrameIfPossible(
     }
     sourceMapPayload = maybeSourceMapPayload
     try {
+      // Pass the source map URL as the second parameter so that the consumer
+      // can resolve relative paths in the source map's `sources` array. This is
+      // a guess! Turbopack places .map files as siblings to the chunks so this
+      // is sufficient to compute relative paths but is actually wrong (the
+      // chunk and sourcemap have different content hashes). We are using the
+      // node API to read the sourcemap and it doesn't give us access to the
+      // URI. Devirtualize `about://React/Server/file:///path/to/chunk.js?4` to
+      // `file:///path/to/chunk.js` so that relative `sources` in the source map
+      // resolve against the real chunk URL, not the virtual one.
+      const sourceMapURL = devirtualizeReactServerURL(sourceURL) + '.map'
       sourceMapConsumer = new SyncSourceMapConsumer(
-        // @ts-expect-error -- Module.SourceMap['version'] is number but SyncSourceMapConsumer wants a string
-        sourceMapPayload
+        sourceMapPayload,
+        // @ts-expect-error: our typings don't include this parameter but it is here.
+        sourceMapURL
       )
     } catch (cause) {
       // We should not log an actual error instance here because that will re-enter
@@ -204,13 +263,13 @@ function getSourcemappedFrameIfPossible(
   }
 
   const sourcePosition = sourceMapConsumer.originalPositionFor({
-    column: frame.column ?? 0,
-    line: frame.lineNumber ?? 1,
+    column: (frame.column1 ?? 1) - 1,
+    line: frame.line1 ?? 1,
   })
 
   const applicableSourceMap = findApplicableSourceMapPayload(
-    frame.lineNumber ?? 0,
-    frame.column ?? 0,
+    (frame.line1 ?? 1) - 1,
+    (frame.column1 ?? 1) - 1,
     sourceMapPayload
   )
   let ignored =
@@ -220,9 +279,9 @@ function getSourcemappedFrameIfPossible(
     return {
       stack: {
         arguments: frame.arguments,
-        column: frame.column,
         file: frame.file,
-        lineNumber: frame.lineNumber,
+        line1: frame.line1,
+        column1: frame.column1,
         methodName: frame.methodName,
         ignored: ignored || shouldIgnoreListGeneratedFrame(frame.file),
       },
@@ -249,7 +308,7 @@ function getSourcemappedFrameIfPossible(
     ignored = applicableSourceMap.ignoreList?.includes(sourceIndex) ?? false
   }
 
-  const originalFrame: IgnoreableStackFrame = {
+  const originalFrame: IgnorableStackFrame = {
     // We ignore the sourcemapped name since it won't be the correct name.
     // The callsite will point to the column of the variable name instead of the
     // name of the enclosing function.
@@ -257,49 +316,42 @@ function getSourcemappedFrameIfPossible(
     methodName: frame.methodName
       ?.replace('__WEBPACK_DEFAULT_EXPORT__', 'default')
       ?.replace('__webpack_exports__.', ''),
-    column: sourcePosition.column,
     file: sourcePosition.source,
-    lineNumber: sourcePosition.line,
+    line1: sourcePosition.line,
+    column1: sourcePosition.column + 1,
     // TODO: c&p from async createOriginalStackFrame but why not frame.arguments?
     arguments: [],
     ignored,
   }
 
-  /** undefined = not yet computed*/
+  /** undefined = not yet computed */
   let codeFrame: string | null | undefined
 
-  return Object.defineProperty(
-    {
-      stack: originalFrame,
-      code: null,
+  return {
+    stack: originalFrame,
+    get code() {
+      if (codeFrame === undefined) {
+        const sourceContent: string | null =
+          sourceMapConsumer.sourceContentFor(
+            sourcePosition.source,
+            /* returnNullOnMissing */ true
+          ) ?? null
+        codeFrame = getOriginalCodeFrame(
+          originalFrame,
+          sourceContent,
+          inspectOptions.colors
+        )
+      }
+      return codeFrame
     },
-    'code',
-    {
-      get: () => {
-        if (codeFrame === undefined) {
-          const sourceContent: string | null =
-            sourceMapConsumer.sourceContentFor(
-              sourcePosition.source,
-              /* returnNullOnMissing */ true
-            ) ?? null
-          codeFrame = getOriginalCodeFrame(
-            originalFrame,
-            sourceContent,
-            inspectOptions.colors
-          )
-        }
-        return codeFrame
-      },
-    }
-  )
+  }
 }
 
 function parseAndSourceMap(
   error: Error,
   inspectOptions: util.InspectOptions
 ): string {
-  // TODO(veil): Expose as CLI arg or config option. Useful for local debugging.
-  const showIgnoreListed = false
+  const showIgnoreListed = process.env.__NEXT_SHOW_IGNORE_LISTED === 'true'
   // We overwrote Error.prepareStackTrace earlier so error.stack is not sourcemapped.
   let unparsedStack = String(error.stack)
   // We could just read it from `error.stack`.
@@ -324,11 +376,24 @@ function parseAndSourceMap(
   const unsourcemappedStack = parseStack(unparsedStack)
   const sourceMapCache: SourceMapCache = new Map()
 
-  let sourceMappedStack = ''
+  const sourceMappedFrames: Array<{
+    stack: IgnorableStackFrame
+    code: string | null
+  }> = []
   let sourceFrame: null | string = null
   for (const frame of unsourcemappedStack) {
     if (frame.file === null) {
-      sourceMappedStack += '\n' + frameToString(frame)
+      sourceMappedFrames.push({
+        code: null,
+        stack: {
+          file: frame.file,
+          line1: frame.line1,
+          column1: frame.column1,
+          methodName: frame.methodName,
+          arguments: frame.arguments,
+          ignored: false,
+        },
+      })
     } else {
       const sourcemappedFrame = getSourcemappedFrameIfPossible(
         // We narrowed this earlier by bailing if `frame.file` is null.
@@ -336,7 +401,11 @@ function parseAndSourceMap(
         sourceMapCache,
         inspectOptions
       )
+      sourceMappedFrames.push(sourcemappedFrame)
 
+      // We can determine the sourceframe here.
+      // anonymous frames won't have a sourceframe so we don't need to scan
+      // all stacks again to check if they are sandwiched between ignored frames.
       if (
         sourceFrame === null &&
         // TODO: Is this the right choice?
@@ -345,15 +414,47 @@ function parseAndSourceMap(
       ) {
         sourceFrame = sourcemappedFrame.code
       }
-      if (!sourcemappedFrame.stack.ignored) {
-        // TODO: Consider what happens if every frame is ignore listed.
-        sourceMappedStack += '\n' + frameToString(sourcemappedFrame.stack)
-      } else if (showIgnoreListed && !inspectOptions.colors) {
-        sourceMappedStack += '\n' + frameToString(sourcemappedFrame.stack)
-      } else if (showIgnoreListed) {
-        sourceMappedStack += '\n' + dim(frameToString(sourcemappedFrame.stack))
-      }
     }
+  }
+
+  ignoreListAnonymousStackFramesIfSandwiched(sourceMappedFrames)
+
+  let sourceMappedStack = ''
+  for (let i = 0; i < sourceMappedFrames.length; i++) {
+    const frame = sourceMappedFrames[i]
+
+    if (!frame.stack.ignored) {
+      sourceMappedStack +=
+        '\n' +
+        frameToString(
+          frame.stack.methodName,
+          frame.stack.file,
+          frame.stack.line1,
+          frame.stack.column1
+        )
+    } else if (showIgnoreListed) {
+      sourceMappedStack +=
+        '\n' +
+        dim(
+          frameToString(
+            frame.stack.methodName,
+            frame.stack.file,
+            frame.stack.line1,
+            frame.stack.column1
+          )
+        )
+    }
+  }
+
+  if (sourceMappedStack === '' && sourceMappedFrames.length > 0) {
+    // The `at` marker is important so that Node.js doesn't add square brackets
+    // around the stringified error i.e. this results in
+    // Error: message
+    //   at <ignore-listed frames>
+    // instead of
+    // [Error: message
+    //   at <ignore-listed frames>]
+    sourceMappedStack = '\n    at ' + italic('ignore-listed frames')
   }
 
   return (
@@ -370,13 +471,16 @@ function sourceMapError(
   error: Error,
   inspectOptions: util.InspectOptions
 ): Error {
+  // Setting an undefined `cause` would print `[cause]: undefined`
+  const options = error.cause !== undefined ? { cause: error.cause } : undefined
+
   // Create a new Error object with the source mapping applied and then use native
   // Node.js formatting on the result.
   const newError =
-    error.cause !== undefined
-      ? // Setting an undefined `cause` would print `[cause]: undefined`
-        new Error(error.message, { cause: error.cause })
-      : new Error(error.message)
+    error instanceof AggregateError
+      ? // Preserve AggregateError's `errors` instance property
+        new AggregateError(error.errors, error.message, options)
+      : new Error(error.message, options)
 
   // TODO: Ensure `class MyError extends Error {}` prints `MyError` as the name
   newError.stack = parseAndSourceMap(error, inspectOptions)
@@ -400,7 +504,6 @@ export function patchErrorInspectNodeJS(
   errorConstructor.prepareStackTrace = prepareUnsourcemappedStackTrace
 
   // @ts-expect-error -- TODO upstream types
-  // eslint-disable-next-line no-extend-native -- We're not extending but overriding.
   errorConstructor.prototype[inspectSymbol] = function (
     depth: number,
     inspectOptions: util.InspectOptions,
@@ -421,10 +524,7 @@ export function patchErrorInspectNodeJS(
       try {
         return inspect(newError, {
           ...inspectOptions,
-          depth:
-            (inspectOptions.depth ??
-              // Default in Node.js
-              2) - depth,
+          depth,
         })
       } finally {
         ;(newError as any)[inspectSymbol] = originalCustomInspect
@@ -441,7 +541,6 @@ export function patchErrorInspectEdgeLite(
   errorConstructor.prepareStackTrace = prepareUnsourcemappedStackTrace
 
   // @ts-expect-error -- TODO upstream types
-  // eslint-disable-next-line no-extend-native -- We're not extending but overriding.
   errorConstructor.prototype[inspectSymbol] = function ({
     format,
   }: {

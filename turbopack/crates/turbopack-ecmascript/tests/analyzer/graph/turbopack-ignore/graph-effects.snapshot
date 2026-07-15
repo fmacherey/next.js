@@ -1,8 +1,5 @@
 [
-    Call {
-        func: FreeVar(
-            "import",
-        ),
+    DynamicImport {
         args: [
             Value(
                 Constant(
@@ -52,12 +49,10 @@
         ],
         span: 19..58,
         in_try: false,
-        new: false,
+        export_usage: All,
     },
     FreeVar {
-        var: FreeVar(
-            "require",
-        ),
+        var: "require",
         ast_path: [
             Program(
                 Module,
@@ -98,7 +93,6 @@
             ),
         ],
         span: 71..78,
-        in_try: false,
     },
     Call {
         func: FreeVar(
@@ -149,10 +143,7 @@
         in_try: false,
         new: false,
     },
-    Call {
-        func: FreeVar(
-            "import",
-        ),
+    DynamicImport {
         args: [
             Value(
                 Constant(
@@ -202,12 +193,10 @@
         ],
         span: 133..174,
         in_try: false,
-        new: false,
+        export_usage: All,
     },
     FreeVar {
-        var: FreeVar(
-            "require",
-        ),
+        var: "require",
         ast_path: [
             Program(
                 Module,
@@ -248,7 +237,6 @@
             ),
         ],
         span: 187..194,
-        in_try: false,
     },
     Call {
         func: FreeVar(
@@ -300,9 +288,7 @@
         new: false,
     },
     FreeVar {
-        var: FreeVar(
-            "require",
-        ),
+        var: "require",
         ast_path: [
             Program(
                 Module,
@@ -343,12 +329,17 @@
             ),
         ],
         span: 245..252,
-        in_try: false,
     },
     Call {
-        func: FreeVar(
-            "require",
-        ),
+        func: Unknown {
+            original_value: Some(
+                FreeVar(
+                    "require",
+                ),
+            ),
+            reason: "turbopackIgnore",
+            has_side_effects: true,
+        },
         args: [
             Value(
                 Constant(
@@ -395,9 +386,7 @@
         new: false,
     },
     FreeVar {
-        var: FreeVar(
-            "require",
-        ),
+        var: "require",
         ast_path: [
             Program(
                 Module,
@@ -438,7 +427,6 @@
             ),
         ],
         span: 300..307,
-        in_try: false,
     },
     Call {
         func: FreeVar(
@@ -490,9 +478,7 @@
         new: false,
     },
     FreeVar {
-        var: FreeVar(
-            "require",
-        ),
+        var: "require",
         ast_path: [
             Program(
                 Module,
@@ -533,12 +519,17 @@
             ),
         ],
         span: 356..363,
-        in_try: false,
     },
     Call {
-        func: FreeVar(
-            "require",
-        ),
+        func: Unknown {
+            original_value: Some(
+                FreeVar(
+                    "require",
+                ),
+            ),
+            reason: "turbopackIgnore",
+            has_side_effects: true,
+        },
         args: [
             Value(
                 Constant(
@@ -585,9 +576,7 @@
         new: false,
     },
     FreeVar {
-        var: FreeVar(
-            "require",
-        ),
+        var: "require",
         ast_path: [
             Program(
                 Module,
@@ -628,7 +617,6 @@
             ),
         ],
         span: 413..420,
-        in_try: false,
     },
     Call {
         func: FreeVar(
@@ -680,9 +668,7 @@
         new: false,
     },
     FreeVar {
-        var: FreeVar(
-            "require",
-        ),
+        var: "require",
         ast_path: [
             Program(
                 Module,
@@ -726,12 +712,17 @@
             ),
         ],
         span: 488..495,
-        in_try: false,
     },
     Call {
-        func: FreeVar(
-            "require",
-        ),
+        func: Unknown {
+            original_value: Some(
+                FreeVar(
+                    "require",
+                ),
+            ),
+            reason: "turbopackIgnore",
+            has_side_effects: true,
+        },
         args: [
             Value(
                 Constant(

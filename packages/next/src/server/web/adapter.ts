@@ -19,6 +19,7 @@ import {
   FLIGHT_HEADERS,
   NEXT_REWRITTEN_PATH_HEADER,
   NEXT_REWRITTEN_QUERY_HEADER,
+  NEXT_RSC_UNION_QUERY,
   RSC_HEADER,
 } from '../../client/components/app-router-headers'
 import { ensureInstrumentationRegistered } from './globals'
@@ -26,6 +27,8 @@ import { createRequestStoreForAPI } from '../async-storage/request-store'
 import { workUnitAsyncStorage } from '../app-render/work-unit-async-storage.external'
 import { createWorkStore } from '../async-storage/work-store'
 import { workAsyncStorage } from '../app-render/work-async-storage.external'
+import { InvariantError } from '../../shared/lib/invariant-error'
+import type { ResolvedCacheLifeProfiles } from '../config-shared'
 import { NEXT_ROUTER_PREFETCH_HEADER } from '../../client/components/app-router-headers'
 import { getTracer } from '../lib/trace/tracer'
 import type { TextMapGetter } from 'next/dist/compiled/@opentelemetry/api'
@@ -34,6 +37,23 @@ import { CloseController } from './web-on-close'
 import { getEdgePreviewProps } from './get-edge-preview-props'
 import { getBuiltinRequestContext } from '../after/builtin-request-context'
 import { getImplicitTags } from '../lib/implicit-tags'
+import { isRSCRequestHeader } from '../lib/is-rsc-request'
+import { setRequestMeta } from '../request-meta'
+
+// The proxy (middleware) does not support `'use cache'`, so this work store
+// never reaches the code that reads `cacheLife` (and `'use cache'` is
+// disallowed on the edge runtime anyway). This sentinel satisfies the
+// non-optional type while throwing if `default` is ever read, matching the
+// "never read" sentinels used for the proxy's other unused renderOpts fields
+// (`staticPageGenerationTimeout: 0`, `useCacheTimeout: 0`). It surfaces loudly
+// rather than silently serving a misleading profile.
+const proxyCacheLifeProfiles: ResolvedCacheLifeProfiles = {
+  get default(): never {
+    throw new InvariantError(
+      'Proxy does not support `use cache`, so reading its `default` cacheLife profile is unexpected.'
+    )
+  },
+}
 
 export class NextRequestHint extends NextRequest {
   sourcePage: string
@@ -74,6 +94,12 @@ export type AdapterOptions = {
   incrementalCacheHandler?: typeof import('../lib/incremental-cache').CacheHandler
   bypassNextUrl?: boolean
 }
+
+// This has to be compatible with what the Vercel builder does as well:
+// https://github.com/vercel/vercel/blob/0e0a6eb9f12216202ae2f5ee37e4ada1796361fd/packages/next/src/edge-function-source/get-edge-function.ts#L112-L136
+export type EdgeHandler = (opts: {
+  request: AdapterOptions['request']
+}) => Promise<FetchEventResult>
 
 let propagator: <T>(request: NextRequestHint, fn: () => T) => T = (
   request,
@@ -139,10 +165,11 @@ export async function adapter(
     buildId = (requestURL as NextURL).buildId || ''
     requestURL.buildId = ''
   }
+  let deploymentId = process.env.NEXT_DEPLOYMENT_ID
 
   const requestHeaders = fromNodeOutgoingHttpHeaders(params.request.headers)
   const isNextDataRequest = requestHeaders.has('x-nextjs-data')
-  const isRSCRequest = requestHeaders.get(RSC_HEADER) === '1'
+  const isRSCRequest = isRSCRequestHeader(requestHeaders.get(RSC_HEADER))
 
   if (isNextDataRequest && requestURL.pathname === '/index') {
     requestURL.pathname = '/'
@@ -151,13 +178,12 @@ export async function adapter(
   const flightHeaders = new Map()
 
   // Headers should only be stripped for middleware
-  if (!isEdgeRendering) {
+  if (!isEdgeRendering && !process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE) {
     for (const header of FLIGHT_HEADERS) {
-      const key = header.toLowerCase()
-      const value = requestHeaders.get(key)
+      const value = requestHeaders.get(header)
       if (value !== null) {
-        flightHeaders.set(key, value)
-        requestHeaders.delete(key)
+        flightHeaders.set(header, value)
+        requestHeaders.delete(header)
       }
     }
   }
@@ -166,10 +192,14 @@ export async function adapter(
     ? new URL(params.request.url)
     : requestURL
 
+  const rscHash = normalizeURL.searchParams.get(NEXT_RSC_UNION_QUERY)
+
   const request = new NextRequestHint({
     page: params.page,
     // Strip internal query parameters off the request.
-    input: stripInternalSearchParams(normalizeURL).toString(),
+    input: process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE
+      ? normalizeURL.toString()
+      : stripInternalSearchParams(normalizeURL).toString(),
     init: {
       body: params.request.body,
       headers: requestHeaders,
@@ -178,6 +208,10 @@ export async function adapter(
       signal: params.request.signal,
     },
   })
+
+  if (params.request.requestMeta) {
+    setRequestMeta(request, params.request.requestMeta)
+  }
 
   /**
    * This allows to identify the request as a data request. The user doesn't
@@ -237,7 +271,10 @@ export async function adapter(
   response = await propagator(request, () => {
     // we only care to make async storage available for middleware
     const isMiddleware =
-      params.page === '/middleware' || params.page === '/src/middleware'
+      params.page === '/middleware' ||
+      params.page === '/src/middleware' ||
+      params.page === '/proxy' ||
+      params.page === '/src/proxy'
 
     if (isMiddleware) {
       // if we're in an edge function, we only get a subset of `nextConfig` (no `experimental`),
@@ -250,7 +287,7 @@ export async function adapter(
       return getTracer().trace(
         MiddlewareSpan.execute,
         {
-          spanName: `middleware ${request.method} ${request.nextUrl.pathname}`,
+          spanName: `middleware ${request.method}`,
           attributes: {
             'http.target': request.nextUrl.pathname,
             'http.method': request.method,
@@ -267,7 +304,7 @@ export async function adapter(
 
             const implicitTags = await getImplicitTags(
               page,
-              request.nextUrl,
+              request.nextUrl.pathname,
               fallbackRouteParams
             )
 
@@ -281,26 +318,37 @@ export async function adapter(
 
             const workStore = createWorkStore({
               page,
-              fallbackRouteParams,
               renderOpts: {
-                cacheLifeProfiles:
-                  params.request.nextConfig?.experimental?.cacheLife,
+                cacheLifeProfiles: proxyCacheLifeProfiles,
+                // Proxy doesn't do static generation, so this value does not
+                // apply here. 0 is a sentinel: if something ever reads it,
+                // it'll surface loudly instead of silently using a misleading
+                // default.
+                staticPageGenerationTimeout: 0,
+                cacheComponents: false,
+                // Proxy doesn't run instant validation; the level value is
+                // irrelevant here.
+                // TODO: remove validationLevel and other global config from renderOpts
+                validationLevel: 'warning',
                 experimental: {
                   isRoutePPREnabled: false,
-                  dynamicIO: false,
                   authInterrupts:
                     !!params.request.nextConfig?.experimental?.authInterrupts,
+                  // Proxy doesn't fill Cache Components entries, so this value
+                  // is never read. 0 is a sentinel: if something ever reads it,
+                  // the cache fill will time out immediately and surface the
+                  // bug.
+                  useCacheTimeout: 0,
                 },
                 supportsDynamicResponse: true,
                 waitUntil,
                 onClose: closeController.onClose.bind(closeController),
                 onAfterTaskError: undefined,
               },
-              requestEndedState: { ended: false },
-              isPrefetchRequest: request.headers.has(
-                NEXT_ROUTER_PREFETCH_HEADER
-              ),
+              isPrefetchRequest:
+                request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '1',
               buildId: buildId ?? '',
+              deploymentId: deploymentId ?? '',
               previouslyRevalidatedTags: [],
             })
 
@@ -381,10 +429,19 @@ export async function adapter(
       response.headers.set('x-nextjs-rewrite', relativeDestination)
     }
 
+    // Check to see if this is a non-relative rewrite. If it is, we need
+    // to check to see if it's an allowed origin to receive the rewritten
+    // headers.
+    const isAllowedOrigin = !isRelative
+      ? params.request.nextConfig?.experimental?.clientParamParsingOrigins?.some(
+          (origin) => new RegExp(origin).test(destination.origin)
+        )
+      : false
+
     // If this is an RSC request, and the pathname or search has changed, and
     // this isn't an external rewrite, we need to set the rewritten pathname and
     // query headers.
-    if (isRSCRequest && isRelative) {
+    if (isRSCRequest && (isRelative || isAllowedOrigin)) {
       if (requestURL.pathname !== destination.pathname) {
         response.headers.set(NEXT_REWRITTEN_PATH_HEADER, destination.pathname)
       }
@@ -395,6 +452,24 @@ export async function adapter(
           destination.search.slice(1)
         )
       }
+    }
+  }
+
+  /**
+   * Always forward the `_rsc` search parameter to the rewritten URL for RSC requests,
+   * unless it's already present. This is necessary to ensure that RSC hash validation
+   * works correctly after a rewrite. For internal rewrites, the server can validate the
+   * RSC hash using the original URL, so forwarding the `_rsc` parameter is less critical.
+   * However, for external rewrites (where the request is proxied to another Next.js server),
+   * the external server does not have access to the original URL or its search parameters.
+   * In these cases, forwarding the `_rsc` parameter is essential so that the external server
+   * can perform the correct RSC hash validation.
+   */
+  if (response && rewrite && isRSCRequest && rscHash) {
+    const rewriteURL = new URL(rewrite)
+    if (!rewriteURL.searchParams.has(NEXT_RSC_UNION_QUERY)) {
+      rewriteURL.searchParams.set(NEXT_RSC_UNION_QUERY, rscHash)
+      response.headers.set('x-middleware-rewrite', rewriteURL.toString())
     }
   }
 
@@ -420,7 +495,10 @@ export async function adapter(
     if (!process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE) {
       if (redirectURL.host === requestURL.host) {
         redirectURL.buildId = buildId || redirectURL.buildId
-        response.headers.set('Location', redirectURL.toString())
+        response.headers.set(
+          'Location',
+          getRelativeURL(redirectURL, requestURL)
+        )
       }
     }
 

@@ -1,20 +1,17 @@
 import type { OverlayState } from '../../shared'
-import type { OverlayDispatch } from '../../shared'
+import type { StackFrame } from '../../../shared/stack-frame'
 
 import { useMemo, useState, useEffect } from 'react'
 import {
   getErrorByType,
   type ReadyRuntimeError,
 } from '../../utils/get-error-by-type'
-import type { StackFrame } from 'next/dist/compiled/stacktrace-parser'
-import type { ComponentStackFrame } from '../../utils/parse-component-stack'
-import { usePersistentCacheErrorDetection } from '../../components/errors/error-overlay-toolbar/restart-server-button'
+import { isInstantNavigationError } from '../errors'
 
 export type SupportedErrorEvent = {
   id: number
   error: Error
-  frames: StackFrame[]
-  componentStackFrames?: ComponentStackFrame[]
+  frames: readonly StackFrame[]
   type: 'runtime' | 'recoverable' | 'console'
 }
 
@@ -22,10 +19,11 @@ type Props = {
   children: (params: {
     runtimeErrors: ReadyRuntimeError[]
     totalErrorCount: number
+    normalErrorCount: number
+    instantErrorCount: number
   }) => React.ReactNode
   state: OverlayState
   isAppDir: boolean
-  dispatch: OverlayDispatch
 }
 
 export const RenderError = (props: Props) => {
@@ -39,7 +37,7 @@ export const RenderError = (props: Props) => {
   }
 }
 
-const RenderRuntimeError = ({ children, state, isAppDir, dispatch }: Props) => {
+const RenderRuntimeError = ({ children, state, isAppDir }: Props) => {
   const { errors } = state
 
   const [lookups, setLookups] = useState<{
@@ -68,32 +66,29 @@ const RenderRuntimeError = ({ children, state, isAppDir, dispatch }: Props) => {
     return [ready, next]
   }, [errors, lookups])
 
-  usePersistentCacheErrorDetection({ errors, dispatch })
-
   useEffect(() => {
     if (nextError == null) {
       return
     }
 
-    let mounted = true
-
-    getErrorByType(nextError, isAppDir).then((resolved) => {
-      if (mounted) {
-        // We don't care if the desired error changed while we were resolving,
-        // thus we're not tracking it using a ref. Once the work has been done,
-        // we'll store it.
-        setLookups((m) => ({ ...m, [resolved.id]: resolved }))
-      }
-    })
-
-    return () => {
-      mounted = false
-    }
+    const resolved = getErrorByType(nextError, isAppDir)
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- TODO: fetch-while-rendering
+    setLookups((m) => ({ ...m, [resolved.id]: resolved }))
   }, [nextError, isAppDir])
 
   const totalErrorCount = errors.length
+  const instantErrorCount = useMemo(
+    () => runtimeErrors.filter((e) => isInstantNavigationError(e.error)).length,
+    [runtimeErrors]
+  )
+  const normalErrorCount = runtimeErrors.length - instantErrorCount
 
-  return children({ runtimeErrors, totalErrorCount })
+  return children({
+    runtimeErrors,
+    totalErrorCount,
+    normalErrorCount,
+    instantErrorCount,
+  })
 }
 
 const RenderBuildError = ({ children }: Props) => {
@@ -102,5 +97,7 @@ const RenderBuildError = ({ children }: Props) => {
     // Build errors and missing root layout tags persist until fixed,
     // so we can set a fixed error count of 1
     totalErrorCount: 1,
+    normalErrorCount: 1,
+    instantErrorCount: 0,
   })
 }

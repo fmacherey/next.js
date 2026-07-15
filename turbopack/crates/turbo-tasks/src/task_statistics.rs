@@ -19,17 +19,13 @@ impl TaskStatisticsApi {
         })
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.inner.get().is_some()
-    }
-
     // Calls `func` if statistics have been enabled (via
     // [`TaskStatisticsApi::enable`]).
     pub fn map<T>(&self, func: impl FnOnce(&Arc<TaskStatistics>) -> T) -> Option<T> {
         self.get().map(func)
     }
 
-    // Calls `func` if statistics have been enabled (via
+    // Returns the statistics if they have been enabled (via
     // [`TaskStatisticsApi::enable`]).
     pub fn get(&self) -> Option<&Arc<TaskStatistics>> {
         self.inner.get()
@@ -57,13 +53,17 @@ impl TaskStatistics {
     ) {
         func(self.inner.entry(native_fn).or_default().value_mut())
     }
+
+    pub fn get(&self, f: &'static NativeFunction) -> TaskFunctionStatistics {
+        self.inner.get(f).unwrap().value().clone()
+    }
 }
 
 /// Statistics for an individual function.
-#[derive(Default, Serialize)]
-struct TaskFunctionStatistics {
-    cache_hit: u32,
-    cache_miss: u32,
+#[derive(Default, Serialize, Clone)]
+pub struct TaskFunctionStatistics {
+    pub cache_hit: u32,
+    pub cache_miss: u32,
 }
 
 impl Serialize for TaskStatistics {
@@ -71,9 +71,19 @@ impl Serialize for TaskStatistics {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(self.inner.len()))?;
-        for entry in &self.inner {
-            map.serialize_entry(entry.key().global_name(), entry.value())?;
+        // Sort by `global_name` so the emitted JSON is deterministic — the
+        // underlying `FxDashMap` has unspecified iteration order. The map is
+        // small (~1500 entries in practice), so the sort cost is negligible
+        // and not worth optimizing.
+        let mut entries: Vec<_> = self
+            .inner
+            .iter()
+            .map(|e| (e.key().ty.global_name, e.value().clone()))
+            .collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (name, stats) in &entries {
+            map.serialize_entry(name, stats)?;
         }
         map.end()
     }

@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from '@storybook/react'
 import { CallStack } from './call-stack'
-import { withShadowPortal } from '../../storybook/with-shadow-portal'
+import { withShadowPortal } from '../../../../../.storybook/decorators/with-shadow-portal'
 
 const meta: Meta<typeof CallStack> = {
   component: CallStack,
@@ -33,16 +33,16 @@ const frame = {
     file: './app/page.tsx',
     methodName: 'MyComponent',
     arguments: [],
-    lineNumber: 10,
-    column: 5,
+    line1: 10,
+    column1: 5,
     ignored: false,
   },
   sourceStackFrame: {
     file: './app/page.tsx',
     methodName: 'MyComponent',
     arguments: [],
-    lineNumber: 10,
-    column: 5,
+    line1: 10,
+    column1: 5,
   },
   originalCodeFrame: 'export default function MyComponent() {',
   error: false as const,

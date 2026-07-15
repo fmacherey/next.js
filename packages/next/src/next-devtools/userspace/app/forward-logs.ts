@@ -1,13 +1,5 @@
-import { configure } from 'next/dist/compiled/safe-stable-stringify'
-import {
-  getOwnerStack,
-  setOwnerStackIfAvailable,
-} from './errors/stitched-error'
 import { getErrorSource } from '../../../shared/lib/error-source'
-import {
-  getTerminalLoggingConfig,
-  getIsTerminalLoggingEnabled,
-} from './terminal-logging-config'
+import { getIsTerminalLoggingEnabled } from './terminal-logging-config'
 import {
   type ConsoleEntry,
   type ConsoleErrorEntry,
@@ -15,28 +7,14 @@ import {
   type ClientLogEntry,
   type LogMethod,
   patchConsoleMethod,
-  UNDEFINED_MARKER,
+  wasErrorAlreadyLoggedOnServer,
 } from '../../shared/forward-logs-shared'
+import { preLogSerializationClone, logStringify } from './forward-logs-utils'
+import { getOwnerStack } from './errors/stitched-error'
 
-const terminalLoggingConfig = getTerminalLoggingConfig()
-export const PROMISE_MARKER = 'Promise {}'
-export const UNAVAILABLE_MARKER = '[Unable to view]'
-
-const maximumDepth =
-  typeof terminalLoggingConfig === 'object' && terminalLoggingConfig.depthLimit
-    ? terminalLoggingConfig.depthLimit
-    : 5
-const maximumBreadth =
-  typeof terminalLoggingConfig === 'object' && terminalLoggingConfig.edgeLimit
-    ? terminalLoggingConfig.edgeLimit
-    : 100
-
-const stringify = configure({
-  maximumDepth,
-  maximumBreadth,
-})
-
-export const isTerminalLoggingEnabled = getIsTerminalLoggingEnabled()
+const isTerminalLoggingEnabled = getIsTerminalLoggingEnabled()
+const shouldForwardLogs =
+  isTerminalLoggingEnabled || !!process.env.__NEXT_MCP_SERVER
 
 const methods: Array<LogMethod> = [
   'log',
@@ -52,71 +30,6 @@ const methods: Array<LogMethod> = [
   'groupEnd',
   'trace',
 ]
-/**
- * allows us to:
- * - revive the undefined log in the server as it would look in the browser
- * - not read/attempt to serialize promises (next will console error if you do that, and will cause this program to infinitely recurse)
- * - if we read a proxy that throws (no way to detect if something is a proxy), explain to the user we can't read this data
- */
-export function preLogSerializationClone<T>(
-  value: T,
-  seen = new WeakMap()
-): any {
-  if (value === undefined) return UNDEFINED_MARKER
-  if (value === null || typeof value !== 'object') return value
-  if (seen.has(value as object)) return seen.get(value as object)
-
-  try {
-    Object.keys(value as object)
-  } catch {
-    return UNAVAILABLE_MARKER
-  }
-
-  try {
-    if (typeof (value as any).then === 'function') return PROMISE_MARKER
-  } catch {
-    return UNAVAILABLE_MARKER
-  }
-
-  if (Array.isArray(value)) {
-    const out: any[] = []
-    seen.set(value, out)
-    for (const item of value) {
-      try {
-        out.push(preLogSerializationClone(item, seen))
-      } catch {
-        out.push(UNAVAILABLE_MARKER)
-      }
-    }
-    return out
-  }
-
-  const proto = Object.getPrototypeOf(value)
-  if (proto === Object.prototype || proto === null) {
-    const out: Record<string, unknown> = {}
-    seen.set(value as object, out)
-    for (const key of Object.keys(value as object)) {
-      try {
-        out[key] = preLogSerializationClone((value as any)[key], seen)
-      } catch {
-        out[key] = UNAVAILABLE_MARKER
-      }
-    }
-    return out
-  }
-
-  return Object.prototype.toString.call(value)
-}
-
-// only safe if passed safeClone data
-export const logStringify = (data: unknown): string => {
-  try {
-    const result = stringify(data)
-    return result ?? `"${UNAVAILABLE_MARKER}"`
-  } catch {
-    return `"${UNAVAILABLE_MARKER}"`
-  }
-}
 
 const afterThisFrame = (cb: () => void) => {
   let timeout: ReturnType<typeof setTimeout> | undefined
@@ -154,6 +67,25 @@ const serializeEntries = (entries: Array<ClientLogEntry>) =>
     }
   })
 
+const flushBufferedEntries = (socket: WebSocket) => {
+  if (logQueue.entries.length === 0) {
+    return
+  }
+
+  const payload = JSON.stringify({
+    event: 'browser-logs',
+    entries: serializeEntries(logQueue.entries),
+    router: logQueue.router,
+    // needed for source mapping, we just assign the sourceType from the last error for the whole batch
+    sourceType: logQueue.sourceType,
+  })
+
+  socket.send(payload)
+  logQueue.entries = []
+  logQueue.sourceType = undefined
+}
+
+// Combined state and public API
 export const logQueue: {
   entries: Array<ClientLogEntry>
   onSocketReady: (socket: WebSocket) => void
@@ -190,17 +122,7 @@ export const logQueue: {
 
       // just incase
       try {
-        const payload = JSON.stringify({
-          event: 'browser-logs',
-          entries: serializeEntries(logQueue.entries),
-          router: logQueue.router,
-          // needed for source mapping, we just assign the sourceType from the last error for the whole batch
-          sourceType: logQueue.sourceType,
-        })
-
-        socket.send(payload)
-        logQueue.entries = []
-        logQueue.sourceType = undefined
+        flushBufferedEntries(socket)
       } catch {
         // error (make sure u don't infinite loop)
         /* noop */
@@ -208,6 +130,11 @@ export const logQueue: {
     })
   },
   onSocketReady: (socket: WebSocket) => {
+    // When MCP or terminal logging is enabled, we enable the socket connection,
+    // otherwise it will not proceed.
+    if (!shouldForwardLogs) {
+      return
+    }
     if (socket.readyState !== WebSocket.OPEN) {
       // invariant
       return
@@ -216,17 +143,9 @@ export const logQueue: {
     // incase an existing timeout was going to run with a stale socket
     logQueue.cancelFlush?.()
     logQueue.socket = socket
-    try {
-      const payload = JSON.stringify({
-        event: 'browser-logs',
-        entries: serializeEntries(logQueue.entries),
-        router: logQueue.router,
-        sourceType: logQueue.sourceType,
-      })
 
-      socket.send(payload)
-      logQueue.entries = []
-      logQueue.sourceType = undefined
+    try {
+      flushBufferedEntries(socket)
     } catch {
       /** noop just incase */
     }
@@ -253,18 +172,21 @@ const stringifyUserArg = (
 }
 
 const createErrorArg = (error: Error) => {
-  const stack = stackWithOwners(error)
   return {
     kind: 'formatted-error-arg' as const,
     prefix: error.message ? `${error.name}: ${error.message}` : `${error.name}`,
-    stack,
+    stack: getErrorStackWithOwnerStack(error),
   }
 }
 
 const createLogEntry = (level: LogMethod, args: any[]) => {
+  if (!shouldForwardLogs) {
+    return
+  }
+
   // do not abstract this, it implicitly relies on which functions call it. forcing the inlined implementation makes you think about callers
   // error capture stack trace maybe
-  const stack = stackWithOwners(new Error())
+  const stack = getErrorStack(new Error())
   const stackLines = stack?.split('\n')
   const cleanStack = stackLines?.slice(3).join('\n') // this is probably ignored anyways
   const entry: ConsoleEntry<unknown> = {
@@ -286,8 +208,24 @@ const createLogEntry = (level: LogMethod, args: any[]) => {
 }
 
 export const forwardErrorLog = (args: any[]) => {
+  // Skip React server replayed logs - they were already logged on the server
+  if (isReactServerReplayedLog(args)) {
+    return
+  }
+
+  if (!shouldForwardLogs) {
+    return
+  }
+
   const errorObjects = args.filter((arg) => arg instanceof Error)
   const first = errorObjects.at(0)
+  // Skip errors that originated on the server and were already logged there
+  // (e.g. Cache Components validation errors that are also sent to the browser
+  // to show in the dev overlay). Forwarding them back would duplicate them in
+  // the terminal.
+  if (first && wasErrorAlreadyLoggedOnServer(first)) {
+    return
+  }
   if (first) {
     const source = getErrorSource(first)
     if (source) {
@@ -299,7 +237,7 @@ export const forwardErrorLog = (args: any[]) => {
    *
    * do not abstract this, it implicitly relies on which functions call it. forcing the inlined implementation makes you think about callers
    */
-  const stack = stackWithOwners(new Error())
+  const stack = getErrorStack(new Error())
   const stackLines = stack?.split('\n')
   const cleanStack = stackLines?.slice(3).join('\n')
 
@@ -336,17 +274,27 @@ const createUncaughtErrorEntry = (
   logQueue.scheduleLogSend(entry)
 }
 
-const stackWithOwners = (error: Error) => {
-  let ownerStack = ''
-  setOwnerStackIfAvailable(error)
-  ownerStack = getOwnerStack(error) || ''
-  const stack = (error.stack || '') + ownerStack
-  return stack
+const getErrorStack = (error: Error) => {
+  return error.stack || ''
+}
+
+// Get error stack with owner stack appended for source mapping on the server
+const getErrorStackWithOwnerStack = (error: Error) => {
+  const errorStack = getErrorStack(error)
+  const ownerStack = getOwnerStack(error)
+  return ownerStack ? `${errorStack}\n${ownerStack}` : errorStack
 }
 
 export function logUnhandledRejection(reason: unknown) {
+  if (!shouldForwardLogs) {
+    return
+  }
+
   if (reason instanceof Error) {
-    createUnhandledRejectionErrorEntry(reason, stackWithOwners(reason))
+    createUnhandledRejectionErrorEntry(
+      reason,
+      getErrorStackWithOwnerStack(reason)
+    )
     return
   }
   createUnhandledRejectionNonErrorEntry(reason)
@@ -409,7 +357,10 @@ const isHMR = (args: any[]) => {
   return false
 }
 
-const isIgnoredLog = (args: any[]) => {
+/**
+ * Matches the format of logs arguments React replayed from the RSC.
+ */
+const isReactServerReplayedLog = (args: any[]) => {
   if (args.length < 3) {
     return false
   }
@@ -424,12 +375,19 @@ const isIgnoredLog = (args: any[]) => {
     return false
   }
 
-  // kinda hacky, we should define a common format for these strings so we can safely ignore
   return format.startsWith('%c%s%c') && styles.includes('background:')
 }
 
 export function forwardUnhandledError(error: Error) {
-  createUncaughtErrorEntry(error.name, error.message, stackWithOwners(error))
+  if (!shouldForwardLogs) {
+    return
+  }
+
+  createUncaughtErrorEntry(
+    error.name,
+    error.message,
+    getErrorStackWithOwnerStack(error)
+  )
 }
 
 // TODO: this router check is brittle, we need to update based on the current router the user is using
@@ -450,7 +408,7 @@ export const initializeDebugLogForwarding = (router: 'app' | 'pages'): void => {
         if (isHMR(args)) {
           return
         }
-        if (isIgnoredLog(args)) {
+        if (isReactServerReplayedLog(args)) {
           return
         }
         createLogEntry(method, args)

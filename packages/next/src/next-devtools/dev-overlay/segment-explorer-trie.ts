@@ -62,9 +62,11 @@ function createTrie<Value = string>({
   getCharacters?: (item: Value) => string[]
   compare?: (a: Value | undefined, b: Value | undefined) => boolean
 }): Trie<Value> {
+  // Null-prototype children so segment names that collide with
+  // Object.prototype members (e.g. "constructor", "toString") work correctly.
   let root: TrieNode<Value> = {
     value: undefined,
-    children: {},
+    children: Object.create(null),
   }
 
   function markUpdated() {
@@ -82,7 +84,7 @@ function createTrie<Value = string>({
         currentNode.children[segment] = {
           value: undefined,
           // Skip value for intermediate nodes
-          children: {},
+          children: Object.create(null),
         }
       }
       currentNode = currentNode.children[segment]
@@ -132,7 +134,7 @@ function createTrie<Value = string>({
   return { insert, remove, getRoot }
 }
 
-export type SegmentTrie = Trie<SegmentNodeState>
+type SegmentTrie = Trie<SegmentNodeState>
 export type SegmentTrieNode = TrieNode<SegmentNodeState>
 
 const trie: SegmentTrie = createTrie({
@@ -148,6 +150,7 @@ const trie: SegmentTrie = createTrie({
 })
 export const insertSegmentNode = trie.insert
 export const removeSegmentNode = trie.remove
+export const getSegmentTrieRoot = trie.getRoot
 
 export function useSegmentTree(): SegmentTrieNode {
   const state = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)

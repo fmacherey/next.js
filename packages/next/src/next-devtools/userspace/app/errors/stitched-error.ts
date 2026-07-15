@@ -2,14 +2,6 @@ import React from 'react'
 import isError from '../../../../lib/is-error'
 
 const ownerStacks = new WeakMap<Error, string | null>()
-const componentStacks = new WeakMap<Error, string>()
-
-export function getComponentStack(error: Error): string | undefined {
-  return componentStacks.get(error)
-}
-export function setComponentStack(error: Error, stack: string) {
-  componentStacks.set(error, stack)
-}
 
 export function getOwnerStack(error: Error): string | null | undefined {
   return ownerStacks.get(error)
@@ -25,20 +17,18 @@ export function coerceError(value: unknown): Error {
 export function setOwnerStackIfAvailable(error: Error): void {
   // React 18 and prod does not have `captureOwnerStack`
   if ('captureOwnerStack' in React) {
-    setOwnerStack(error, React.captureOwnerStack())
+    const ownerStack = React.captureOwnerStack()
+    // Only set if we captured a valid owner stack, or if none exists yet.
+    // This prevents overwriting a valid owner stack captured earlier
+    // (e.g., in onRecoverableError) with null captured later.
+    if (ownerStack || !ownerStacks.has(error)) {
+      setOwnerStack(error, ownerStack)
+    }
   }
 }
 
-export function decorateDevError(
-  thrownValue: unknown,
-  errorInfo: React.ErrorInfo
-) {
+export function decorateDevError(thrownValue: unknown) {
   const error = coerceError(thrownValue)
   setOwnerStackIfAvailable(error)
-  // TODO: change to passing down errorInfo later
-  // In development mode, pass along the component stack to the error
-  if (errorInfo.componentStack) {
-    setComponentStack(error, errorInfo.componentStack)
-  }
   return error
 }

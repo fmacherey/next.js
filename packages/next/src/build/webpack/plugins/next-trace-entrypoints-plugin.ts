@@ -18,10 +18,9 @@ import picomatch from 'next/dist/compiled/picomatch'
 import { getModuleBuildInfo } from '../loaders/get-module-build-info'
 import { getPageFilePath } from '../../entries'
 import { resolveExternal } from '../../handle-externals'
-import swcLoader, { type SWCLoaderOptions } from '../loaders/next-swc-loader'
 import { isMetadataRouteFile } from '../../../lib/metadata/is-metadata-route'
+import { isMiddlewareFilename } from '../../utils'
 import { getCompilationSpan } from '../utils'
-import { isClientComponentEntryModule } from '../loaders/utils'
 
 const PLUGIN_NAME = 'TraceEntryPointsPlugin'
 export const TRACE_IGNORES = [
@@ -139,10 +138,6 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
   private traceIgnores: string[]
   private esmExternals?: NextConfigComplete['experimental']['esmExternals']
   private compilerType: CompilerNameValues
-  private swcLoaderConfig: {
-    loader: string
-    options: Partial<SWCLoaderOptions>
-  }
 
   constructor({
     rootDir,
@@ -153,7 +148,6 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
     traceIgnores,
     esmExternals,
     outputFileTracingRoot,
-    swcLoaderConfig,
   }: {
     rootDir: string
     compilerType: CompilerNameValues
@@ -163,7 +157,6 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
     traceIgnores?: string[]
     outputFileTracingRoot?: string
     esmExternals?: NextConfigComplete['experimental']['esmExternals']
-    swcLoaderConfig: TraceEntryPointsPlugin['swcLoaderConfig']
   }) {
     this.rootDir = rootDir
     this.appDir = appDir
@@ -174,7 +167,6 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
     this.traceIgnores = traceIgnores || []
     this.tracingRoot = outputFileTracingRoot || rootDir
     this.compilerType = compilerType
-    this.swcLoaderConfig = swcLoaderConfig
   }
 
   // Here we output all traced assets and webpack chunks to a
@@ -344,8 +336,14 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
                   const isPage = normalizedName.startsWith('pages/')
                   const isApp =
                     this.appDirEnabled && normalizedName.startsWith('app/')
+                  // Middleware/proxy lives at the project root rather than
+                  // under pages/ or app/, so it gets its own gate. Without
+                  // this, source-level NFT analysis is skipped for the
+                  // middleware/proxy entry and runtime fs/path/process.cwd()
+                  // patterns never make it into `middleware.js.nft.json`.
+                  const isMiddleware = isMiddlewareFilename(normalizedName)
 
-                  if (isApp || isPage) {
+                  if (isApp || isPage || isMiddleware) {
                     for (const dep of entry.dependencies) {
                       if (!dep) continue
                       const entryMod = getModuleFromDependency(compilation, dep)
@@ -356,16 +354,24 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
                         const moduleBuildInfo = getModuleBuildInfo(entryMod)
                         // All loaders that are used to create entries have a `route` property on the buildInfo.
                         if (moduleBuildInfo.route) {
-                          const absolutePath = getPageFilePath({
-                            absolutePagePath:
-                              moduleBuildInfo.route.absolutePagePath,
-                            rootDir: this.rootDir,
-                            appDir: this.appDir,
-                            pagesDir: this.pagesDir,
-                          })
+                          // Middleware/proxy sources live at the project root,
+                          // not under pagesDir/appDir, so `getPageFilePath`
+                          // does not apply — use the absolutePagePath directly.
+                          const absolutePath = isMiddleware
+                            ? moduleBuildInfo.route.absolutePagePath
+                            : getPageFilePath({
+                                absolutePagePath:
+                                  moduleBuildInfo.route.absolutePagePath,
+                                rootDir: this.rootDir,
+                                appDir: this.appDir,
+                                pagesDir: this.pagesDir,
+                              })
 
-                          // Ensures we don't handle non-pages.
+                          // Skip entries whose source is neither a pages/app
+                          // file (under pagesDir/appDir) nor a middleware/proxy
+                          // file at the project root.
                           if (
+                            isMiddleware ||
                             (this.pagesDir &&
                               absolutePath.startsWith(this.pagesDir)) ||
                             (this.appDir &&
@@ -409,18 +415,6 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
                 }
               })
 
-            const readOriginalSource = (path: string) => {
-              return new Promise<string | Buffer>((resolve) => {
-                compilation.inputFileSystem.readFile(path, (err, result) => {
-                  if (err) {
-                    // we can't throw here as that crashes build un-necessarily
-                    return resolve('')
-                  }
-                  resolve(result || '')
-                })
-              })
-            }
-
             const readFile = async (
               path: string
             ): Promise<Buffer | string | null> => {
@@ -429,60 +423,6 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
               // map the transpiled source when available to avoid
               // parse errors in node-file-trace
               let source: Buffer | string = mod?.originalSource?.()?.buffer()
-
-              try {
-                // fallback to reading raw source file, this may fail
-                // due to unsupported syntax but best effort attempt
-                let usingOriginalSource = false
-                if (!source || isClientComponentEntryModule(mod)) {
-                  source = await readOriginalSource(path)
-                  usingOriginalSource = true
-                }
-                const sourceString = source.toString()
-
-                // If this is a client component we need to trace the
-                // original transpiled source not the client proxy which is
-                // applied before this plugin is run due to the
-                // client-module-loader
-                if (
-                  usingOriginalSource &&
-                  // don't attempt transpiling CSS or image imports
-                  path.match(/\.(tsx|ts|js|cjs|mjs|jsx)$/)
-                ) {
-                  let transformResolve: (result: string) => void
-                  let transformReject: (error: unknown) => void
-                  const transformPromise = new Promise<string>(
-                    (resolve, reject) => {
-                      transformResolve = resolve
-                      transformReject = reject
-                    }
-                  )
-
-                  // TODO: should we apply all loaders except the
-                  // client-module-loader?
-                  swcLoader.apply(
-                    {
-                      resourcePath: path,
-                      getOptions: () => {
-                        return this.swcLoaderConfig.options
-                      },
-                      async: () => {
-                        return (err: unknown, result: string) => {
-                          if (err) {
-                            return transformReject(err)
-                          }
-                          return transformResolve(result)
-                        }
-                      },
-                    },
-                    [sourceString, undefined]
-                  )
-                  source = await transformPromise
-                }
-              } catch {
-                /* non-fatal */
-              }
-
               return source || ''
             }
 
@@ -566,6 +506,7 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
                     : undefined,
                   ignore: ignoreFn,
                   mixedModules: true,
+                  moduleSyncCatchall: true,
                 })
                 // @ts-ignore
                 fileList = result.fileList

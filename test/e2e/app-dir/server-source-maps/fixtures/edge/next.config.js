@@ -4,8 +4,10 @@
 const nextConfig = {
   experimental: {
     cpus: 1,
-    enablePrerenderSourceMaps: true,
     serverSourceMaps: true,
+    instantInsights: {
+      validationLevel: 'manual-warning',
+    },
   },
 }
 

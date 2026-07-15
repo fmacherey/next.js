@@ -1,5 +1,4 @@
 #![feature(arbitrary_self_types)]
-#![feature(arbitrary_self_types_pointers)]
 
 use anyhow::Result;
 use turbo_tasks::{TaskInput, TransientValue, Vc};
@@ -7,7 +6,7 @@ use turbo_tasks_testing::{Registration, register, run_without_cache_check};
 
 static REGISTRATION: Registration = register!();
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_transient_vc() -> Result<()> {
     run_without_cache_check(&REGISTRATION, async {
         test_transient_operation(TransientValue::new(123))
@@ -18,7 +17,7 @@ async fn test_transient_vc() -> Result<()> {
     .await
 }
 
-#[turbo_tasks::function(operation)]
+#[turbo_tasks::function(operation, root)]
 async fn test_transient_operation(transient_arg: TransientValue<i32>) -> Result<()> {
     let called_with_transient = has_transient_arg(transient_arg);
     let called_with_persistent = has_persistent_arg(123);

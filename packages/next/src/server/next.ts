@@ -3,10 +3,9 @@ import type {
   NodeRequestHandler,
   Options as ServerOptions,
 } from './next-server'
-import type { UrlWithParsedQuery } from 'url'
 import type { IncomingMessage, ServerResponse } from 'http'
 import type { Duplex } from 'stream'
-import type { NextUrlWithParsedQuery } from './request-meta'
+import type { NextUrlWithParsedQuery, RequestMeta } from './request-meta'
 
 import './require-hook'
 import './node-polyfill-crypto'
@@ -14,7 +13,7 @@ import './node-polyfill-crypto'
 import type { default as NextNodeServer } from './next-server'
 import * as log from '../build/output/log'
 import loadConfig from './config'
-import path, { resolve } from 'path'
+import path from 'node:path'
 import { NON_STANDARD_NODE_ENV } from '../lib/constants'
 import {
   PHASE_DEVELOPMENT_SERVER,
@@ -52,6 +51,15 @@ export type NextServerOptions = Omit<
 > &
   Partial<Pick<ServerOptions | DevServerOptions, 'conf'>>
 
+export type NextBundlerOptions = {
+  /** @deprecated Use `turbopack` instead */
+  turbo?: boolean
+  /** Selects Turbopack as the bundler */
+  turbopack?: boolean
+  /** Selects Webpack as the bundler */
+  webpack?: boolean
+}
+
 export type RequestHandler = (
   req: IncomingMessage,
   res: ServerResponse,
@@ -66,6 +74,45 @@ export type UpgradeHandler = (
 
 const SYMBOL_LOAD_CONFIG = Symbol('next.load_config')
 
+type DeprecatedCustomServerMethod =
+  | 'setAssetPrefix'
+  | 'logError'
+  | 'logErrorWithOriginalStack'
+  | 'revalidate'
+  | 'render'
+  | 'renderToHTML'
+  | 'renderError'
+  | 'renderErrorToHTML'
+  | 'render404'
+
+const DEPRECATED_CUSTOM_SERVER_METHOD_GUIDANCE: Record<
+  DeprecatedCustomServerMethod,
+  string
+> = {
+  setAssetPrefix: 'Please configure `assetPrefix` in `next.config.js` instead.',
+  logError: 'Please use application logging instead.',
+  logErrorWithOriginalStack: 'Please use application logging instead.',
+  revalidate: 'Please use documented application revalidation APIs instead.',
+  render:
+    'Please use `app.getRequestHandler()` with an adjusted parsed URL instead.',
+  renderToHTML:
+    'Please use `app.getRequestHandler()` with an adjusted parsed URL instead.',
+  renderError:
+    'Please use `app.getRequestHandler()` with an adjusted parsed URL instead.',
+  renderErrorToHTML:
+    'Please use `app.getRequestHandler()` with an adjusted parsed URL instead.',
+  render404:
+    'Please use `app.getRequestHandler()` with an adjusted parsed URL instead.',
+}
+
+function warnDeprecatedCustomServerMethod(
+  method: DeprecatedCustomServerMethod
+) {
+  log.warnOnce(
+    `The \`app.${method}()\` method is deprecated in custom servers. ${DEPRECATED_CUSTOM_SERVER_METHOD_GUIDANCE[method]}`
+  )
+}
+
 interface NextWrapperServer {
   // NOTE: the methods/properties here are the public API for custom servers.
   // Consider backwards compatibilty when changing something here!
@@ -76,6 +123,7 @@ interface NextWrapperServer {
 
   getRequestHandler(): RequestHandler
   prepare(serverFields?: ServerFields): Promise<void>
+  /** @deprecated Configure `assetPrefix` in `next.config.js` instead. */
   setAssetPrefix(assetPrefix: string): void
   close(): Promise<void>
 
@@ -84,30 +132,48 @@ interface NextWrapperServer {
 
   // legacy methods that we left exposed in the past
 
+  /** @deprecated Use application logging instead. */
   logError(...args: Parameters<NextNodeServer['logError']>): void
 
+  /** @deprecated Use documented application revalidation APIs instead. */
   revalidate(
     ...args: Parameters<NextNodeServer['revalidate']>
   ): ReturnType<NextNodeServer['revalidate']>
 
+  /** @deprecated Use application logging instead. */
   logErrorWithOriginalStack(err: unknown, type: string): void
 
+  /**
+   * @deprecated Use `app.getRequestHandler()` with an adjusted parsed URL instead.
+   */
   render(
     ...args: Parameters<NextNodeServer['render']>
   ): ReturnType<NextNodeServer['render']>
 
+  /**
+   * @deprecated Use `app.getRequestHandler()` with an adjusted parsed URL instead.
+   */
   renderToHTML(
     ...args: Parameters<NextNodeServer['renderToHTML']>
   ): ReturnType<NextNodeServer['renderToHTML']>
 
+  /**
+   * @deprecated Use `app.getRequestHandler()` with an adjusted parsed URL instead.
+   */
   renderError(
     ...args: Parameters<NextNodeServer['renderError']>
   ): ReturnType<NextNodeServer['renderError']>
 
+  /**
+   * @deprecated Use `app.getRequestHandler()` with an adjusted parsed URL instead.
+   */
   renderErrorToHTML(
     ...args: Parameters<NextNodeServer['renderErrorToHTML']>
   ): ReturnType<NextNodeServer['renderErrorToHTML']>
 
+  /**
+   * @deprecated Use `app.getRequestHandler()` with an adjusted parsed URL instead.
+   */
   render404(
     ...args: Parameters<NextNodeServer['render404']>
   ): ReturnType<NextNodeServer['render404']>
@@ -139,12 +205,36 @@ export class NextServer implements NextWrapperServer {
     return async (
       req: IncomingMessage,
       res: ServerResponse,
-      parsedUrl?: UrlWithParsedQuery
+      parsedUrl?: NextUrlWithParsedQuery
     ) => {
-      return getTracer().trace(NextServerSpan.getRequestHandler, async () => {
-        const requestHandler = await this.getServerRequestHandler()
-        return requestHandler(req, res, parsedUrl)
-      })
+      const tracer = getTracer()
+      return tracer.withPropagatedContext(req.headers, () =>
+        tracer.trace(NextServerSpan.getRequestHandler, async () => {
+          const requestHandler = await this.getServerRequestHandler()
+          return requestHandler(req, res, parsedUrl)
+        })
+      )
+    }
+  }
+
+  /**
+   * @internal - this method is internal to Next.js and should not be used
+   * directly by end-users, only used in testing
+   */
+  getRequestHandlerWithMetadata(meta: RequestMeta): RequestHandler {
+    return async (
+      req: IncomingMessage,
+      res: ServerResponse,
+      parsedUrl?: NextUrlWithParsedQuery
+    ) => {
+      const tracer = getTracer()
+      return tracer.withPropagatedContext(req.headers, () =>
+        tracer.trace(NextServerSpan.getRequestHandlerWithMetadata, async () => {
+          const server = await this.getServer()
+          const handler = server.getRequestHandlerWithMetadata(meta)
+          return handler(req, res, parsedUrl)
+        })
+      )
     }
   }
 
@@ -247,7 +337,9 @@ export class NextServer implements NextWrapperServer {
   }
 
   private async [SYMBOL_LOAD_CONFIG]() {
-    const dir = resolve(this.options.dir || '.')
+    const dir = path.resolve(
+      /* turbopackIgnore: true */ this.options.dir || '.'
+    )
 
     const config = await loadConfig(
       this.options.dev ? PHASE_DEVELOPMENT_SERVER : PHASE_PRODUCTION_SERVER,
@@ -262,7 +354,12 @@ export class NextServer implements NextWrapperServer {
     if (!this.options.dev) {
       try {
         const serializedConfig = require(
-          path.join(dir, config.distDir, SERVER_FILES_MANIFEST)
+          /* turbopackIgnore: true */
+          path.join(
+            /* turbopackIgnore: true */ dir,
+            config.distDir,
+            SERVER_FILES_MANIFEST + '.json'
+          )
         ).config
 
         config.experimental.isExperimentalCompile =
@@ -366,6 +463,10 @@ class NextCustomServer implements NextWrapperServer {
   }
 
   async prepare() {
+    if (this.options.dev) {
+      process.env.__NEXT_DEV_SERVER = '1'
+    }
+
     const { getRequestHandlers } =
       require('./lib/start-server') as typeof import('./lib/start-server')
 
@@ -407,7 +508,7 @@ class NextCustomServer implements NextWrapperServer {
     return async (
       req: IncomingMessage,
       res: ServerResponse,
-      parsedUrl?: UrlWithParsedQuery
+      parsedUrl?: NextUrlWithParsedQuery
     ) => {
       this.setupWebSocketHandler(this.options.httpServer, req)
 
@@ -420,6 +521,7 @@ class NextCustomServer implements NextWrapperServer {
   }
 
   async render(...args: Parameters<NextWrapperServer['render']>) {
+    warnDeprecatedCustomServerMethod('render')
     let [req, res, pathname, query, parsedUrl] = args
     this.setupWebSocketHandler(this.options.httpServer, req as IncomingMessage)
 
@@ -440,6 +542,7 @@ class NextCustomServer implements NextWrapperServer {
   }
 
   setAssetPrefix(assetPrefix: string): void {
+    warnDeprecatedCustomServerMethod('setAssetPrefix')
     this.server.setAssetPrefix(assetPrefix)
 
     // update the router-server nextConfig instance as
@@ -464,32 +567,39 @@ class NextCustomServer implements NextWrapperServer {
   }
 
   logError(...args: Parameters<NextWrapperServer['logError']>) {
+    warnDeprecatedCustomServerMethod('logError')
     this.server.logError(...args)
   }
 
   logErrorWithOriginalStack(err: unknown, type: string) {
+    warnDeprecatedCustomServerMethod('logErrorWithOriginalStack')
     return this.server.logErrorWithOriginalStack(err, type)
   }
 
   async revalidate(...args: Parameters<NextWrapperServer['revalidate']>) {
+    warnDeprecatedCustomServerMethod('revalidate')
     return this.server.revalidate(...args)
   }
 
   async renderToHTML(...args: Parameters<NextWrapperServer['renderToHTML']>) {
+    warnDeprecatedCustomServerMethod('renderToHTML')
     return this.server.renderToHTML(...args)
   }
 
   async renderError(...args: Parameters<NextWrapperServer['renderError']>) {
+    warnDeprecatedCustomServerMethod('renderError')
     return this.server.renderError(...args)
   }
 
   async renderErrorToHTML(
     ...args: Parameters<NextWrapperServer['renderErrorToHTML']>
   ) {
+    warnDeprecatedCustomServerMethod('renderErrorToHTML')
     return this.server.renderErrorToHTML(...args)
   }
 
   async render404(...args: Parameters<NextWrapperServer['render404']>) {
+    warnDeprecatedCustomServerMethod('render404')
     return this.server.render404(...args)
   }
 
@@ -503,17 +613,35 @@ class NextCustomServer implements NextWrapperServer {
 
 // This file is used for when users run `require('next')`
 function createServer(
-  options: NextServerOptions & {
-    turbo?: boolean
-    turbopack?: boolean
-  }
+  options: NextServerOptions & NextBundlerOptions
 ): NextWrapperServer {
-  if (
-    options &&
-    (options.turbo || options.turbopack || process.env.IS_TURBOPACK_TEST)
-  ) {
-    process.env.TURBOPACK = '1'
+  // next sets customServer to false when calling this function, in that case we don't want to modify the environment variables
+  const isCustomServer = options?.customServer ?? true
+  if (isCustomServer) {
+    const selectTurbopack =
+      options &&
+      (options.turbo || options.turbopack || process.env.IS_TURBOPACK_TEST)
+    const selectWebpack =
+      options && (options.webpack || process.env.IS_WEBPACK_TEST)
+    // Rspack is selected through env/config side effects instead of a custom
+    // server option, so don't fall back to the default Turbopack auto mode.
+    const selectRspack = !!process.env.NEXT_RSPACK
+    if (selectTurbopack && selectWebpack && selectRspack) {
+      throw new Error('Pass either `webpack` or `turbopack`, not both.')
+    }
+    if (selectTurbopack) {
+      process.env.TURBOPACK ??= '1'
+    } else if (!selectWebpack && !selectRspack) {
+      process.env.TURBOPACK ??= 'auto'
+    }
+  } else {
+    if (options && (options.webpack || options.turbo || options.turbopack)) {
+      throw new Error(
+        'Only custom servers can pass `webpack`, `turbo`, or `turbopack`.'
+      )
+    }
   }
+
   // The package is used as a TypeScript plugin.
   if (
     options &&
@@ -549,7 +677,7 @@ function createServer(
 
   // When the caller is a custom server (using next()).
   if (options.customServer !== false) {
-    const dir = resolve(options.dir || '.')
+    const dir = path.resolve(/* turbopackIgnore: true */ options.dir || '.')
 
     return new NextCustomServer({
       ...options,

@@ -1,120 +1,134 @@
 import type { Options as SWCOptions } from '@swc/core'
-import type { CompilerOptions } from 'typescript'
 
-import { resolve } from 'node:path'
-import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { readFileSync, existsSync } from 'node:fs'
+import { pathToFileURL } from 'node:url'
 import { deregisterHook, registerHook, requireFromString } from './require-hook'
-import { warn } from '../output/log'
-import { installDependencies } from '../../lib/install-dependencies'
+import { warn, warnOnce } from '../output/log'
+import { getNodeOptionsArgs } from '../../server/lib/utils'
+import {
+  loadTsConfigOptions,
+  type RelevantCompilerOptions,
+} from '../../lib/typescript/loadTsConfig'
 
 function resolveSWCOptions(
   cwd: string,
-  compilerOptions: CompilerOptions
+  compilerOptions: RelevantCompilerOptions
 ): SWCOptions {
-  const resolvedBaseUrl = resolve(cwd, compilerOptions.baseUrl ?? '.')
   return {
     jsc: {
-      target: 'es5',
       parser: {
         syntax: 'typescript',
       },
-      paths: compilerOptions.paths,
-      baseUrl: resolvedBaseUrl,
+      ...(compilerOptions.paths ? { paths: compilerOptions.paths } : {}),
+      ...(compilerOptions.baseUrl
+        ? // Needs to be an absolute path.
+          { baseUrl: path.resolve(cwd, compilerOptions.baseUrl) }
+        : compilerOptions.paths
+          ? // If paths is given, baseUrl is required.
+            { baseUrl: compilerOptions.pathsBasePath ?? cwd }
+          : {}),
     },
     module: {
       type: 'commonjs',
     },
     isModule: 'unknown',
+    env: {
+      targets: {
+        // Setting the Node.js version can reduce unnecessary code generation.
+        node: process?.versions?.node ?? '20.19.0',
+      },
+    },
   } satisfies SWCOptions
 }
 
-// Ported from next/src/lib/verify-typescript-setup.ts
-// Although this overlaps with the later `verifyTypeScriptSetup`,
-// it is acceptable since the time difference in the worst case is trivial,
-// as we are only preparing to install the dependencies once more.
-async function verifyTypeScriptSetup(cwd: string, configFileName: string) {
-  try {
-    // Quick module check.
-    require.resolve('typescript', { paths: [cwd] })
-  } catch (error) {
-    if (
-      error &&
-      typeof error === 'object' &&
-      'code' in error &&
-      error.code === 'MODULE_NOT_FOUND'
-    ) {
-      warn(
-        `Installing TypeScript as it was not found while loading "${configFileName}".`
-      )
-
-      await installDependencies(cwd, [{ pkg: 'typescript' }], true).catch(
-        (err) => {
-          if (err && typeof err === 'object' && 'command' in err) {
-            console.error(
-              `Failed to install TypeScript, please install it manually to continue:\n` +
-                (err as any).command +
-                '\n'
-            )
-          }
-          throw err
-        }
-      )
-    }
-  }
-}
-
-async function getTsConfig(cwd: string): Promise<CompilerOptions> {
-  const ts: typeof import('typescript') = require(
-    require.resolve('typescript', { paths: [cwd] })
-  )
-
+async function loadTsConfig(dir: string): Promise<RelevantCompilerOptions> {
   // NOTE: This doesn't fully cover the edge case for setting
   // "typescript.tsconfigPath" in next config which is currently
   // a restriction.
-  const tsConfigPath = ts.findConfigFile(
-    cwd,
-    ts.sys.fileExists,
-    'tsconfig.json'
-  )
+  // It's a chicken-and-egg problem since we need to transpile
+  // the next config to get that value.
+  const resolvedTsConfigPath = path.join(dir, 'tsconfig.json')
 
-  if (!tsConfigPath) {
-    // It is ok to not return ts.getDefaultCompilerOptions() because
-    // we are only lookfing for paths and baseUrl from tsConfig.
+  if (!existsSync(resolvedTsConfigPath)) {
     return {}
   }
 
-  const configFile = ts.readConfigFile(tsConfigPath, ts.sys.readFile)
-  const parsedCommandLine = ts.parseJsonConfigFileContent(
-    configFile.config,
-    ts.sys,
-    cwd
-  )
-
-  return parsedCommandLine.options
+  return loadTsConfigOptions(resolvedTsConfigPath)
 }
 
 export async function transpileConfig({
   nextConfigPath,
-  configFileName,
-  cwd,
+  dir,
 }: {
   nextConfigPath: string
-  configFileName: string
-  cwd: string
+  dir: string
 }) {
+  try {
+    // envs are passed to the workers and preserve the flag
+    if (process.env.__NEXT_NODE_NATIVE_TS_LOADER_ENABLED === 'true') {
+      try {
+        // Node.js v22.10.0+
+        // Value is 'strip' or 'transform' based on how the feature is enabled.
+        // https://nodejs.org/api/process.html#processfeaturestypescript
+        // TODO: Remove `as any` once we bump @types/node to v22.10.0+
+        if ((process.features as any).typescript) {
+          // Run import() here to catch errors and fallback to legacy resolution.
+          return (await import(pathToFileURL(nextConfigPath).href)).default
+        }
+
+        if (
+          getNodeOptionsArgs().includes('--no-experimental-strip-types') ||
+          process.execArgv.includes('--no-experimental-strip-types')
+        ) {
+          warnOnce(
+            `Skipped resolving "${path.basename(nextConfigPath)}" using Node.js native TypeScript resolution because it was disabled by the "--no-experimental-strip-types" flag.` +
+              ' Falling back to legacy resolution.' +
+              ' Learn more: https://nextjs.org/docs/app/api-reference/config/typescript#using-nodejs-native-typescript-resolver-for-nextconfigts'
+          )
+        }
+
+        // Feature is not enabled, fallback to legacy resolution for current session.
+        process.env.__NEXT_NODE_NATIVE_TS_LOADER_ENABLED = 'false'
+      } catch (cause) {
+        warnOnce(
+          `Failed to import "${path.basename(nextConfigPath)}" using Node.js native TypeScript resolution.` +
+            ' Falling back to legacy resolution.' +
+            ' Learn more: https://nextjs.org/docs/app/api-reference/config/typescript#using-nodejs-native-typescript-resolver-for-nextconfigts',
+          { cause }
+        )
+        // Once failed, fallback to legacy resolution for current session.
+        process.env.__NEXT_NODE_NATIVE_TS_LOADER_ENABLED = 'false'
+      }
+    }
+
+    const compilerOptions = await loadTsConfig(dir)
+    return handleCJS({ dir, nextConfigPath, compilerOptions })
+  } catch (cause) {
+    throw new Error(`Failed to transpile "${path.basename(nextConfigPath)}".`, {
+      cause,
+    })
+  }
+}
+
+async function handleCJS({
+  dir,
+  nextConfigPath,
+  compilerOptions,
+}: {
+  dir: string
+  nextConfigPath: string
+  compilerOptions: RelevantCompilerOptions
+}) {
+  const swcOptions = resolveSWCOptions(dir, compilerOptions)
   let hasRequire = false
   try {
-    // Ensure TypeScript is installed to use the API.
-    await verifyTypeScriptSetup(cwd, configFileName)
-
-    const compilerOptions = await getTsConfig(cwd)
-    const swcOptions = resolveSWCOptions(cwd, compilerOptions)
-
-    const nextConfigString = await readFile(nextConfigPath, 'utf8')
+    const nextConfigString = readFileSync(nextConfigPath, 'utf8')
     // lazy require swc since it loads React before even setting NODE_ENV
     // resulting loading Development React on Production
-    const { transform } = require('../swc') as typeof import('../swc')
-    const { code } = await transform(nextConfigString, swcOptions)
+    const { loadBindings } = require('../swc') as typeof import('../swc')
+    const bindings = await loadBindings()
+    const { code } = await bindings.transform(nextConfigString, swcOptions)
 
     // register require hook only if require exists
     if (code.includes('require(')) {
@@ -123,7 +137,21 @@ export async function transpileConfig({
     }
 
     // filename & extension don't matter here
-    return requireFromString(code, resolve(cwd, 'next.config.compiled.js'))
+    const config = requireFromString(
+      code,
+      path.resolve(dir, 'next.config.compiled.js')
+    )
+    // At this point we have already loaded the bindings without this configuration setting due to the `transform` call above.
+    // Possibly we fell back to wasm in which case, it all works out but if not we need to warn
+    // that the configuration was ignored.
+    if (config?.experimental?.useWasmBinary && !bindings.isWasm) {
+      warn(
+        'Using a next.config.ts file is incompatible with `experimental.useWasmBinary` unless ' +
+          '`--experimental-next-config-strip-types` is also passed.\nSetting `useWasmBinary` to `false'
+      )
+      config.experimental.useWasmBinary = false
+    }
+    return config
   } catch (error) {
     throw error
   } finally {

@@ -25,6 +25,16 @@ export function resolveRobots(data: MetadataRoute.Robots): string {
     if (rule.crawlDelay) {
       content += `Crawl-delay: ${rule.crawlDelay}\n`
     }
+    if (rule.other) {
+      for (const key of Object.keys(rule.other)) {
+        const value = rule.other[key]
+        if (value == null) continue
+        const values = Array.isArray(value) ? value : [value]
+        for (const v of values) {
+          content += `${key}: ${v}\n`
+        }
+      }
+    }
     content += '\n'
   }
   if (data.host) {
@@ -52,15 +62,15 @@ export function resolveSitemap(data: MetadataRoute.Sitemap): string {
 
   let content = ''
   content += '<?xml version="1.0" encoding="UTF-8"?>\n'
-  content += '<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9"'
+  content += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
   if (hasImages) {
-    content += ' xmlns:image="https://www.google.com/schemas/sitemap-image/1.1"'
+    content += ' xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"'
   }
   if (hasVideos) {
-    content += ' xmlns:video="https://www.google.com/schemas/sitemap-video/1.1"'
+    content += ' xmlns:video="http://www.google.com/schemas/sitemap-video/1.1"'
   }
   if (hasAlternates) {
-    content += ' xmlns:xhtml="https://www.w3.org/1999/xhtml">\n'
+    content += ' xmlns:xhtml="http://www.w3.org/1999/xhtml">\n'
   } else {
     content += '>\n'
   }

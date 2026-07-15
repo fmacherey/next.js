@@ -5,13 +5,14 @@ use std::{
 };
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use turbo_rcstr::RcStr;
 
 use crate::{
     FxIndexMap,
     bottom_up::build_bottom_up_graph,
-    span::{SpanGraph, SpanGraphEvent, SpanIndex},
+    span::{SpanGraph, SpanGraphEvent},
     span_bottom_up_ref::SpanBottomUpRef,
-    span_ref::SpanRef,
+    span_ref::{GroupNameToDirectAndRecusiveSpans, SpanRef},
     store::{SpanId, Store},
     timestamp::Timestamp,
 };
@@ -36,11 +37,11 @@ impl<'a> SpanGraphRef<'a> {
         unsafe { SpanId::new_unchecked((self.first_span().index << 1) | 1) }
     }
 
-    pub fn nice_name(&self) -> (&str, &str) {
+    pub fn nice_name(&self) -> (&RcStr, &RcStr) {
         if self.count() == 1 {
             self.first_span().nice_name()
         } else {
-            ("", self.first_span().group_name())
+            self.first_span().group_name()
         }
     }
 
@@ -87,8 +88,7 @@ impl<'a> SpanGraphRef<'a> {
                 self.first_span().extra().graph.get().unwrap().clone()
             } else {
                 let self_group = self.first_span().group_name();
-                let mut map: FxIndexMap<&str, (Vec<SpanIndex>, Vec<SpanIndex>)> =
-                    FxIndexMap::default();
+                let mut map: GroupNameToDirectAndRecusiveSpans = FxIndexMap::default();
                 let mut queue = VecDeque::with_capacity(8);
                 for span in self.recursive_spans() {
                     for span in span.children() {
@@ -303,9 +303,7 @@ impl<'a> SpanGraphRef<'a> {
     }
 }
 
-pub fn event_map_to_list(
-    map: FxIndexMap<&str, (Vec<SpanIndex>, Vec<SpanIndex>)>,
-) -> Vec<SpanGraphEvent> {
+pub fn event_map_to_list(map: GroupNameToDirectAndRecusiveSpans) -> Vec<SpanGraphEvent> {
     map.into_iter()
         .map(|(_, (root_spans, recursive_spans))| {
             let graph = SpanGraph {

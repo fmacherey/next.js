@@ -7,10 +7,10 @@ import {
   getRedboxTotalErrorCount,
 } from 'next-test-utils'
 import path from 'path'
-import { nextTestSetup } from 'e2e-utils'
+import { isReact18, nextTestSetup } from 'e2e-utils'
 
 describe('Client Navigation', () => {
-  const { isTurbopack, next } = nextTestSetup({
+  const { isTurbopack, next, isRspack } = nextTestSetup({
     files: path.join(__dirname, 'fixture'),
     env: {
       TEST_STRICT_NEXT_HEAD: String(true),
@@ -29,14 +29,15 @@ describe('Client Navigation', () => {
       })
       await browser.elementByCss('#empty-props').click()
       await expect(browser).toDisplayRedbox(`
-         {
-           "description": ""EmptyInitialPropsPage.getInitialProps()" should resolve to an object. But found "null" instead.",
-           "environmentLabel": null,
-           "label": "Runtime Error",
-           "source": null,
-           "stack": [],
-         }
-        `)
+       {
+         "code": "E1025",
+         "description": ""EmptyInitialPropsPage.getInitialProps()" should resolve to an object. But found "null" instead.",
+         "environmentLabel": null,
+         "label": "Runtime Error",
+         "source": null,
+         "stack": [],
+       }
+      `)
       expect(pageErrors).toEqual([
         expect.objectContaining({
           message:
@@ -63,7 +64,7 @@ describe('Client Navigation', () => {
     it('should always replace the state', async () => {
       const browser = await next.browser('/nav')
 
-      const countAfterClicked = await browser
+      await browser
         .elementByCss('#self-reload-link')
         .click()
         .waitForElementByCss('#self-reload-page')
@@ -71,11 +72,12 @@ describe('Client Navigation', () => {
         .click()
         .elementByCss('#self-reload-link')
         .click()
-        .elementByCss('p')
-        .text()
 
-      // counts (page change + two clicks)
-      expect(countAfterClicked).toBe('COUNT: 3')
+      // counts (page change + two clicks). Use `retry()` because the third
+      // click's state update may not have flushed when we read the text.
+      await retry(async () => {
+        expect(await browser.elementByCss('p').text()).toBe('COUNT: 3')
+      })
 
       // Since we replace the state, back button would simply go us back to /nav
       await browser.back().waitForElementByCss('.nav-home')
@@ -257,7 +259,6 @@ describe('Client Navigation', () => {
 
   describe('runtime errors', () => {
     it('should show redbox when a client side error is thrown inside a component', async () => {
-      const isReact18 = process.env.NEXT_TEST_REACT_VERSION?.startsWith('18')
       const pageErrors: unknown[] = []
       const browser = await next.browser('/error-inside-browser-page', {
         beforePageLoad: (page) => {
@@ -353,14 +354,31 @@ describe('Client Navigation', () => {
              "description": "An Expected error occurred",
              "environmentLabel": null,
              "label": "Runtime Error",
-             "source": "pages/error-in-the-browser-global-scope.js (2:9) @ [project]/pages/error-in-the-browser-global-scope.js [client] (ecmascript)
+             "source": "pages/error-in-the-browser-global-scope.js (2:9) @ module evaluation
            > 2 |   throw new Error('An Expected error occurred')
                |         ^",
              "stack": [
-               "[project]/pages/error-in-the-browser-global-scope.js [client] (ecmascript) pages/error-in-the-browser-global-scope.js (2:9)",
+               "module evaluation pages/error-in-the-browser-global-scope.js (2:9)",
              ],
            }
           `)
+      } else if (isRspack) {
+        await expect(browser).toDisplayRedbox(`
+         {
+           "description": "An Expected error occurred",
+           "environmentLabel": null,
+           "label": "Runtime Error",
+           "source": "pages/error-in-the-browser-global-scope.js (2:9) @ eval
+         > 2 |   throw new Error('An Expected error occurred')
+             |         ^",
+           "stack": [
+             "eval pages/error-in-the-browser-global-scope.js (2:9)",
+             "<FIXME-next-dist-dir>",
+             "<FIXME-next-dist-dir>",
+             "<FIXME-next-dist-dir>",
+           ],
+         }
+        `)
       } else {
         await expect(browser).toDisplayRedbox(`
            {

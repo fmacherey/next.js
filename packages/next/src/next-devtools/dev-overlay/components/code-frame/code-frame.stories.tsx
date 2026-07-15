@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from '@storybook/react'
 import { CodeFrame } from './code-frame'
-import { withShadowPortal } from '../../storybook/with-shadow-portal'
+import { withShadowPortal } from '../../../../../.storybook/decorators/with-shadow-portal'
 
 const meta: Meta<typeof CodeFrame> = {
   component: CodeFrame,
@@ -17,8 +17,8 @@ const baseStackFrame = {
   file: './app/page.tsx',
   methodName: 'Home',
   arguments: [],
-  lineNumber: 10,
-  column: 5,
+  line1: 10,
+  column1: 5,
 }
 
 export const SimpleCodeFrame: Story = {

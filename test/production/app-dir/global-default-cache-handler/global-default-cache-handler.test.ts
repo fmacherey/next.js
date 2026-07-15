@@ -1,5 +1,5 @@
 import path from 'path'
-import { createNext, FileRef, NextInstance } from 'e2e-utils'
+import { FileRef, nextTestSetup } from 'e2e-utils'
 import {
   fetchViaHTTP,
   findPort,
@@ -12,13 +12,13 @@ describe('global-default-cache-handler', () => {
   let appPort: number
   let server: any
   let output = ''
-  let next: NextInstance
+
+  const { next } = nextTestSetup({
+    files: new FileRef(__dirname),
+    skipStart: true,
+  })
 
   beforeAll(async () => {
-    next = await createNext({
-      files: new FileRef(__dirname),
-      skipStart: true,
-    })
     await next.build()
 
     const standaloneServer = '.next/standalone/server.js'
@@ -43,8 +43,8 @@ describe('global-default-cache-handler', () => {
             console.log('symbol getExpiration', tags)
           },
         
-          expireTags(...tags) {
-            console.log('symbol expireTags', tags)
+          updateTags(...tags) {
+            console.log('symbol updateTags', tags)
           }
         }
       }
@@ -79,7 +79,6 @@ describe('global-default-cache-handler', () => {
     )
   })
   afterAll(async () => {
-    await next.destroy()
     await killApp(server)
   })
 
@@ -93,12 +92,12 @@ describe('global-default-cache-handler', () => {
     })
   })
 
-  it('should call expireTags on global default cache handler', async () => {
+  it('should call updateTags on global default cache handler', async () => {
     const res = await fetchViaHTTP(appPort, '/revalidate-tag', { tag: 'tag1' })
     expect(res.status).toBe(200)
 
     await retry(() => {
-      expect(output).toContain('symbol expireTags')
+      expect(output).toContain('symbol updateTags')
       expect(output).toContain('tag1')
     })
   })
